@@ -1,0 +1,3 @@
+build/
+auth_info/
+*.o
