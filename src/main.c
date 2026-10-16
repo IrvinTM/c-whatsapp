@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "wa_auth.h"
+#include "wa_qr.h"
 #include "wa_socket.h"
 
 #define CWA_VERSION "0.5.0"
@@ -33,7 +34,9 @@ static void usage(const char *argv0) {
 
 static void on_qr(const char *qr, void *user) {
     (void)user;
-    printf("\n[qr] scan with WhatsApp > Linked devices:\n%s\n\n", qr);
+    printf("\n[qr] scan with WhatsApp > Linked devices:\n");
+    wa_qr_print(qr);
+    printf("%s\n\n", qr);
     fflush(stdout);
 }
 

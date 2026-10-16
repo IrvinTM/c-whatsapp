@@ -19,12 +19,14 @@ add_library(cwa_lib
   src/pairing.c
   src/socket.c
   src/send.c
+  src/qr.c
 )
 
 find_package(OpenSSL REQUIRED)
 find_package(ZLIB REQUIRED)
 find_library(SODIUM_LIB sodium REQUIRED)
-target_link_libraries(cwa_lib OpenSSL::Crypto ZLIB::ZLIB ${SODIUM_LIB})
+find_library(QRENCODE_LIB qrencode REQUIRED)
+target_link_libraries(cwa_lib OpenSSL::Crypto ZLIB::ZLIB ${SODIUM_LIB} ${QRENCODE_LIB})
 
 add_executable(c-whatsapp src/main.c)
 target_link_libraries(c-whatsapp cwa_lib)

@@ -28,23 +28,15 @@ via `tools/gen_tokens.py`).
 
 ## Build & test
 
-Requires `gcc`, `make`, OpenSSL + zlib + libsodium dev headers:
+Requires `gcc`, `make`, OpenSSL + zlib + libsodium + qrencode dev headers:
 
 ```
-sudo apt-get install -y libssl-dev zlib1g-dev libsodium-dev
+# Arch:
+sudo pacman -S --needed base-devel openssl zlib libsodium qrencode
+# Debian/Ubuntu:
+sudo apt-get install -y libssl-dev zlib1g-dev libsodium-dev libqrencode-dev
 make        # builds build/c-whatsapp
 make test   # binary codec + auth store + noise + protobuf/pairing
-./build/c-whatsapp --help
-```
-
-## Build & test
-
-Requires `gcc`, `make`, OpenSSL + zlib + libsodium dev headers:
-
-```
-sudo apt-get install -y libssl-dev zlib1g-dev
-make        # builds build/c-whatsapp
-make test   # binary codec + auth store + noise roundtrips
 ./build/c-whatsapp --help
 ```
 

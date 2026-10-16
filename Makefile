@@ -1,13 +1,14 @@
 # c-whatsapp — Makefile (primary build)
-# Requires: gcc, make, OpenSSL + zlib dev headers.
-#   sudo apt-get install -y libssl-dev zlib1g-dev
+# Requires: gcc, make, OpenSSL + zlib + libsodium + qrencode dev headers.
+#   Arch:   sudo pacman -S --needed base-devel openssl zlib libsodium qrencode
+#   Debian: sudo apt-get install -y libssl-dev zlib1g-dev libsodium-dev libqrencode-dev
 CC      ?= gcc
 CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic -g
 CPPFLAGS += -Iinclude
-LDLIBS  += -lssl -lcrypto -lz -lsodium
+LDLIBS  += -lssl -lcrypto -lz -lsodium -lqrencode
 
 BUILD   := build
-LIB_SRC := src/binary.c src/auth.c src/crypto.c src/noise.c src/pb.c src/ws.c src/pairing.c src/socket.c src/send.c
+LIB_SRC := src/binary.c src/auth.c src/crypto.c src/noise.c src/pb.c src/ws.c src/pairing.c src/socket.c src/send.c src/qr.c
 LIB_OBJ := $(patsubst src/%.c,$(BUILD)/%.o,$(LIB_SRC))
 
 all: $(BUILD)/c-whatsapp
