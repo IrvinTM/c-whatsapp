@@ -64,15 +64,15 @@ int main(void) {
         int h, m;
         char to[WA_REM_TO_MAX], text[WA_REM_TEXT_MAX];
         ok(wa_rem_parse_cmd("/reminder Mon-Fri 07:50 +15551234567 Class in ten",
-                            "+50370000000", &days, &h, &m, to, text) == 0,
+                            "+15550000000", &days, &h, &m, to, text) == 0,
            "parse command");
         ok(!strcmp(to, "+15551234567"), "command target");
         ok(!strcmp(text, "Class in ten"), "command text");
-        ok(wa_rem_parse_cmd("/reminder 08:00 maths class", "+50370000000", &days,
+        ok(wa_rem_parse_cmd("/reminder 08:00 maths class", "+15550000000", &days,
                             &h, &m, to, text) == 0,
            "parse command default days+to");
         ok(h == 8 && m == 0, "default command time");
-        ok(!strcmp(to, "+50370000000") && !strcmp(text, "maths class"),
+        ok(!strcmp(to, "+15550000000") && !strcmp(text, "maths class"),
            "default target + text");
     }
 

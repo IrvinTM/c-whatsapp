@@ -485,7 +485,7 @@ static int child_bytes(const wa_node_t *p, const char *tag,
     return 0;
 }
 
-/* +15551234567 / 15551234567 / JID -> bare JID. Returns 0 on success. */
+/* "+15551234567" / "15551234567" / JID -> bare JID. Returns 0 on success. */
 static int normalize_jid(const char *in, char out[WA_SEND_JID_MAX]) {
     char digits[64];
     size_t nd = 0;
