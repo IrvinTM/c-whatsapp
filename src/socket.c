@@ -1370,24 +1370,31 @@ static void handle_command(run_t *r, const char *from, const char *text) {
         body++;
     if (!strncmp(body, "/reminder", 9) &&
         (body[9] == '\0' || body[9] == ' ' || body[9] == '\t')) {
-        unsigned days;
-        int h, m;
-        char to[WA_REM_TO_MAX], txt[WA_REM_TEXT_MAX];
-        if (wa_rem_parse_cmd(body, from, &days, &h, &m, to, txt) == 0) {
-            int id = wa_rem_add(r->opts->auth_dir, days, h, m, to, txt);
-            char ds[64];
+        wa_rem_spec_t spec;
+        if (wa_rem_parse_spec(body, from, wa_rem_local_offset(), &spec) == 0) {
+            int id = wa_rem_add_spec(r->opts->auth_dir, &spec);
             if (id >= 0) {
-                wa_rem_days_format(days, ds);
+                wa_reminder_t tmp;
+                char sched[128];
+                memset(&tmp, 0, sizeof(tmp));
+                tmp.id = id;
+                tmp.days = spec.days;
+                tmp.hour = spec.hour;
+                tmp.min = spec.min;
+                tmp.tz_min = spec.tz_min;
+                tmp.repeat = spec.repeat;
+                snprintf(tmp.date, sizeof(tmp.date), "%s", spec.date);
+                wa_rem_fmt_schedule(&tmp, sched, sizeof(sched));
                 snprintf(reply, sizeof(reply),
-                         "reminder #%d saved: %s %02d:%02d -> %s: %s", id, ds,
-                         h, m, to, txt);
+                         "reminder #%d saved: %s -> %s: %s", id, sched,
+                         spec.to, spec.text);
             } else {
                 snprintf(reply, sizeof(reply), "failed to save reminder");
             }
         } else {
             snprintf(reply, sizeof(reply),
-                     "usage: /reminder [DAYS] HH:MM [TO] TEXT "
-                     "(DAYS=Mon-Fri or *, default Mon-Fri)");
+                     "usage: /reminder [YYYY-MM-DD] HH:MM [UTC-6] "
+                     "[once|daily|weekly|Mon-Fri] [TO] TITLE");
         }
         send_session_text(r, from, reply);
         return;
@@ -1400,11 +1407,11 @@ static void handle_command(run_t *r, const char *from, const char *text) {
         off += (size_t)snprintf(reply + off, sizeof(reply) - off,
                                 "%d reminder(s):", n < 0 ? 0 : n);
         for (int i = 0; i < n && off + 200 < sizeof(reply); i++) {
-            char ds[64];
-            wa_rem_days_format(rems[i].days, ds);
+            char sched[128];
+            wa_rem_fmt_schedule(&rems[i], sched, sizeof(sched));
             off += (size_t)snprintf(reply + off, sizeof(reply) - off,
-                                    "\n#%d %s %02d:%02d %s", rems[i].id, ds,
-                                    rems[i].hour, rems[i].min, rems[i].text);
+                                    "\n#%d %s %s", rems[i].id, sched,
+                                    rems[i].text);
         }
         if (!n)
             snprintf(reply, sizeof(reply), "no reminders");
@@ -1423,8 +1430,9 @@ static void handle_command(run_t *r, const char *from, const char *text) {
     }
     if (!strcmp(body, "/help")) {
         send_session_text(r, from,
-                          "/reminder [DAYS] HH:MM [TO] TEXT | /reminders | "
-                          "/del N");
+                          "/reminder [YYYY-MM-DD] HH:MM [UTC-6] "
+                          "[once|daily|weekly|Mon-Fri] [TO] TITLE | "
+                          "/reminders | /del N");
         return;
     }
 }
@@ -1560,15 +1568,11 @@ static int handle_message(run_t *r, wa_node_t *node) {
  * Dedupe with fired_minute key so each reminder fires once per minute. */
 static void daemon_poll(run_t *r) {
     time_t now = time(NULL);
-    struct tm lt;
     long long key;
     wa_reminder_t rems[WA_REM_MAX];
     int n, i;
-    localtime_r(&now, &lt);
-    key = (long long)(lt.tm_year + 1900) * 100000000LL +
-          (long long)(lt.tm_mon + 1) * 1000000LL +
-          (long long)lt.tm_mday * 10000LL + (long long)lt.tm_hour * 100LL +
-          (long long)lt.tm_min;
+    /* UTC minute: reminders may use different UTC offsets. */
+    key = (long long)(now / 60);
     if (key != r->fired_minute) {
         r->fired_minute = key;
         r->n_fired = 0;
@@ -1593,6 +1597,8 @@ static void daemon_poll(run_t *r) {
             rlog(r, "reminder sent id=%d", rems[i].id);
             if (r->n_fired < WA_REM_MAX)
                 r->fired_ids[r->n_fired++] = rems[i].id;
+            if (rems[i].repeat == WA_REM_ONCE)
+                wa_rem_del(r->opts->auth_dir, rems[i].id);
         } else {
             rlog(r, "reminder failed id=%d (will retry next minute)",
                  rems[i].id);
@@ -2055,7 +2061,10 @@ int wa_conn_run(wa_creds_t *creds, const wa_conn_opts_t *opts) {
                     rlog(&r, "daemon online, polling reminders...");
                 } else {
                     r.listen_on = 1;
-                    rlog(&r, "listening for incoming messages...");
+                    r.rem_check_ms = 0; /* reminders also fire while listening */
+                    r.fired_minute = -1;
+                    r.n_fired = 0;
+                    rlog(&r, "listening for incoming messages and reminders...");
                 }
                 if (r.opts->on_open)
                     r.opts->on_open(r.opts->user);
@@ -2087,7 +2096,7 @@ int wa_conn_run(wa_creds_t *creds, const wa_conn_opts_t *opts) {
             wa_ws_send_ping(&r.ws);
             r.keepalive_ms = now + 25000;
         }
-        if (r.daemon_on && now >= r.rem_check_ms) {
+        if ((r.daemon_on || r.listen_on) && now >= r.rem_check_ms) {
             daemon_poll(&r);
             r.rem_check_ms = now + 15000;
             if (r.outcome >= 0) {
@@ -2100,7 +2109,7 @@ int wa_conn_run(wa_creds_t *creds, const wa_conn_opts_t *opts) {
             wait_ms = (int)(r.qr_deadline_ms - now);
         if (r.end_ms)
             wait_ms = wait_ms < (int)(r.end_ms - now) ? wait_ms : (int)(r.end_ms - now);
-        if (r.daemon_on)
+        if (r.daemon_on || r.listen_on)
             wait_ms = wait_ms < (int)(r.rem_check_ms - now)
                           ? wait_ms
                           : (int)(r.rem_check_ms - now);

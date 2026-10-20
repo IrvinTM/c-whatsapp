@@ -40,7 +40,7 @@ static void usage(const char *argv0) {
     printf("  --remind-list    list reminders\n");
     printf("  --remind-del ID  delete reminder\n");
     printf("  --daemon         keep running, send due reminders (polls 15s)\n");
-    printf("  --listen         stay online, decrypt messages, handle /reminder\n");
+    printf("  --listen         stay online, decrypt messages, fire reminders, handle /reminder\n");
     printf("  -h, --help       this help\n");
 }
 
@@ -165,10 +165,10 @@ int main(int argc, char **argv) {
         if (!n)
             printf("(no reminders in %s/reminders.tsv)\n", auth_dir);
         for (int i = 0; i < n; i++) {
-            char ds[64];
-            wa_rem_days_format(rems[i].days, ds);
-            printf("%d\t%s\t%02d:%02d\t%s\t%s\n", rems[i].id, ds,
-                   rems[i].hour, rems[i].min, rems[i].to, rems[i].text);
+            char sched[128];
+            wa_rem_fmt_schedule(&rems[i], sched, sizeof(sched));
+            printf("%d\t%s\t%s\t%s\n", rems[i].id, sched, rems[i].to,
+                   rems[i].text);
         }
         return 0;
     }

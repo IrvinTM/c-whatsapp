@@ -1,9 +1,14 @@
-/* wa_remind.h — tiny text-file reminder store for class notifications.
+/* wa_remind.h — text-file reminder store for class notifications.
  *
- * File: <auth_dir>/reminders.tsv, one per line:
- *   id<TAB>days<TAB>HH:MM<TAB>to<TAB>text
- * days: comma list and/or ranges, e.g. Mon,Tue,Wed,Thu,Fri / Mon-Fri / *.
- * No deps, phone-friendly.
+ * File: <auth_dir>/reminders.tsv, one reminder per line, version 2:
+ *   id<TAB>date<TAB>HH:MM<TAB>tz<TAB>repeat<TAB>days<TAB>to<TAB>text
+ * date:   YYYY-MM-DD start date, or "-" for none
+ * tz:     offset in minutes east of UTC (e.g. -360 = UTC-6)
+ * repeat: once | daily | weekly
+ * days:   weekly day mask ("Mon-Fri", "*"), "-" when unused
+ *
+ * Legacy 5-field lines (id, days, HH:MM, to, text) are still read and are
+ * treated as weekly reminders in the process's local timezone.
  */
 #ifndef WA_REMIND_H
 #define WA_REMIND_H
@@ -18,15 +23,37 @@ extern "C" {
 #define WA_REM_TO_MAX 160
 #define WA_REM_TEXT_MAX 512
 #define WA_REM_MAX 256
+#define WA_REM_DATE_LEN 10
+
+enum {
+    WA_REM_ONCE = 0,
+    WA_REM_DAILY = 1,
+    WA_REM_WEEKLY = 2
+};
 
 typedef struct {
     int id;
-    unsigned days; /* bitmask, bit0=Sun..bit6=Sat (tm_wday) */
+    unsigned days; /* weekly bitmask, bit0=Sun..bit6=Sat (tm_wday) */
     int hour;
     int min;
+    int tz_min; /* minutes east of UTC (UTC-6 => -360) */
+    int repeat; /* WA_REM_ONCE / WA_REM_DAILY / WA_REM_WEEKLY */
+    char date[WA_REM_DATE_LEN + 1]; /* "" or YYYY-MM-DD (start date) */
     char to[WA_REM_TO_MAX];
     char text[WA_REM_TEXT_MAX];
 } wa_reminder_t;
+
+/* Parsed "/reminder ..." command, before it is assigned an id. */
+typedef struct {
+    unsigned days;
+    int hour;
+    int min;
+    int tz_min;
+    int repeat;
+    char date[WA_REM_DATE_LEN + 1];
+    char to[WA_REM_TO_MAX];
+    char text[WA_REM_TEXT_MAX];
+} wa_rem_spec_t;
 
 /* Parse days like "Mon-Fri", "Mon,Tue,Wed", "*". Returns bitmask, 0=error. */
 unsigned wa_rem_days_parse(const char *s);
@@ -36,25 +63,41 @@ void wa_rem_days_format(unsigned mask, char out[64]);
 /* "HH:MM" -> hour/min. Returns 0 on success. */
 int wa_rem_time_parse(const char *s, int *hour, int *min);
 
+/* "YYYY-MM-DD" -> validated. Returns 0 on success. */
+int wa_rem_date_parse(const char *s, char out[WA_REM_DATE_LEN + 1]);
+
+/* "UTC-6", "GMT+5:30", "(utc-6)", "-6" -> minutes east of UTC.
+ * Returns 0 on success. */
+int wa_rem_tz_parse(const char *s, int *tz_min);
+
+/* Minutes east of UTC for the process's local timezone right now. */
+int wa_rem_local_offset(void);
+
 /* Load all reminders from <auth_dir>/reminders.tsv. Returns count or -1. */
 int wa_rem_load(const char *auth_dir, wa_reminder_t *out, int cap);
-/* Append one reminder, assigning id = max+1. Returns new id or -1. */
+/* Append a weekly reminder in local time (legacy convenience API). */
 int wa_rem_add(const char *auth_dir, unsigned days, int hour, int min,
                const char *to, const char *text);
+/* Append a fully specified reminder. Returns new id or -1. */
+int wa_rem_add_spec(const char *auth_dir, const wa_rem_spec_t *spec);
 /* Delete by id. Returns 0 on success, -1 if not found. */
 int wa_rem_del(const char *auth_dir, int id);
 
-/* True if reminder fires at `now` (local time, minute precision). */
+/* True if reminder fires at `now` (minute precision, reminder's timezone). */
 int wa_rem_due(const wa_reminder_t *r, time_t now);
 
-/* Parse "/reminder ..." or "--remind-add ..." body.
- * Accepts: [days] HH:MM [to] text...
- *   days optional (default Mon-Fri), to optional (default sender/CLI --to).
- * Returns 0 on success. */
+/* Parse "/reminder ..." (see README/help for the grammar). Returns 0. */
+int wa_rem_parse_spec(const char *body, const char *default_to,
+                      int default_tz_min, wa_rem_spec_t *out);
+
+/* Legacy parser kept for callers/tests: fills days/hour/min/to/text. */
 int wa_rem_parse_cmd(const char *body, const char *default_to,
                      unsigned *days, int *hour, int *min,
                      char to_out[WA_REM_TO_MAX],
                      char text_out[WA_REM_TEXT_MAX]);
+
+/* One-line schedule summary: "2026-10-21 07:50 UTC-6 weekly". */
+void wa_rem_fmt_schedule(const wa_reminder_t *r, char *out, size_t cap);
 
 #ifdef __cplusplus
 }
