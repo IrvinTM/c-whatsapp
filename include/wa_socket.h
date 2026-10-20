@@ -57,10 +57,16 @@ typedef struct {
     void (*on_open)(void *user);
     void (*on_close)(const char *reason, void *user);
     void (*on_log)(const char *msg, void *user);
+    /* Called for each successfully decrypted inbound text message. */
+    void (*on_message)(const char *from, const char *text, void *user);
     void *user;
     const char *push_name; /* optional, NULL = omit */
     const char *pair_number; /* optional: digits+country code for code pairing */
     const char *auth_dir; /* saved on creds updates (like creds.update) */
+    const char *to_jid; /* optional: 1:1 send destination (phone or JID) */
+    const char *text; /* optional: text to send with to_jid */
+    int daemon; /* keep running, poll reminders.tsv and send due */
+    int listen; /* stay online and handle inbound messages (no polling) */
     int connect_timeout_ms; /* 0 = 20000 */
     int run_timeout_ms; /* 0 = no overall timeout */
 } wa_conn_opts_t;

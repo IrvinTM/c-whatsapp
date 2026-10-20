@@ -328,6 +328,54 @@ int wa_aes_ctr_encrypt(const uint8_t *in, size_t ilen, const uint8_t key[32],
     return outl + tmplen;
 }
 
+int wa_aes_cbc_encrypt(const uint8_t *in, size_t ilen, const uint8_t key[32],
+                       const uint8_t iv[16], uint8_t *out, size_t olen) {
+    EVP_CIPHER_CTX *ctx;
+    int outl = 0, tmplen = 0, total = 0;
+    if (!in || !out || olen < ilen + 16)
+        return -1;
+    ctx = EVP_CIPHER_CTX_new();
+    if (!ctx)
+        return -1;
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1 ||
+        EVP_EncryptUpdate(ctx, out, &outl, in, (int)ilen) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    total = outl;
+    if (EVP_EncryptFinal_ex(ctx, out + total, &tmplen) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    total += tmplen;
+    EVP_CIPHER_CTX_free(ctx);
+    return total;
+}
+
+int wa_aes_cbc_decrypt(const uint8_t *in, size_t ilen, const uint8_t key[32],
+                       const uint8_t iv[16], uint8_t *out, size_t olen) {
+    EVP_CIPHER_CTX *ctx;
+    int outl = 0, tmplen = 0, total = 0;
+    if (!in || !out || !ilen || (ilen % 16) || olen < ilen)
+        return -1;
+    ctx = EVP_CIPHER_CTX_new();
+    if (!ctx)
+        return -1;
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, key, iv) != 1 ||
+        EVP_DecryptUpdate(ctx, out, &outl, in, (int)ilen) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    total = outl;
+    if (EVP_DecryptFinal_ex(ctx, out + total, &tmplen) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        return -1;
+    }
+    total += tmplen;
+    EVP_CIPHER_CTX_free(ctx);
+    return total;
+}
+
 void wa_crockford5(const uint8_t in[5], char out[9]) {
     static const char *ABC = "123456789ABCDEFGHJKLMNPQRSTVWXYZ";
     uint32_t value = 0;
