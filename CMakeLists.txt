@@ -20,6 +20,8 @@ add_library(cwa_lib
   src/socket.c
   src/send.c
   src/qr.c
+  src/remind.c
+  src/signal.c
 )
 
 find_package(OpenSSL REQUIRED)
@@ -47,3 +49,11 @@ add_test(NAME noise COMMAND test_noise)
 add_executable(test_pb tests/test_pb.c)
 target_link_libraries(test_pb cwa_lib)
 add_test(NAME pb COMMAND test_pb)
+
+add_executable(test_signal tests/test_signal.c)
+target_link_libraries(test_signal cwa_lib)
+add_test(NAME signal COMMAND test_signal)
+
+add_executable(test_remind tests/test_remind.c)
+target_link_libraries(test_remind cwa_lib)
+add_test(NAME remind COMMAND test_remind)

@@ -132,6 +132,56 @@ int wa_pb_encode_adv_hmac(const uint8_t *details, size_t details_len,
 /* "2.3000.1043857760" style version used for the build-hash MD5. */
 #define WA_APP_VERSION_STR "2.3000.1043857760"
 
+/* Phase 5 (send): minimal message + Signal protobuf encoders. */
+int wa_pb_encode_wamessage_text(const char *text, wa_pbw_t *out);
+int wa_pb_encode_whisper(const uint8_t *eph_33, uint32_t counter,
+                         uint32_t prev_counter, const uint8_t *ct,
+                         size_t ct_len, wa_pbw_t *out);
+int wa_pb_encode_prekey_msg(const uint8_t *identity_33,
+                            const uint8_t *base_33,
+                            uint32_t registration_id, uint32_t signed_prekey_id,
+                            int have_prekey_id, uint32_t prekey_id,
+                            const uint8_t *inner, size_t inner_len,
+                            wa_pbw_t *out);
+
+/* Phase 5 (recv): Signal + WAMessage decoders (borrowed pointers). */
+typedef struct {
+    const uint8_t *ephemeral_key;
+    size_t ephemeral_key_len;
+    uint32_t counter;
+    int has_counter;
+    uint32_t previous_counter;
+    int has_previous_counter;
+    const uint8_t *ciphertext;
+    size_t ciphertext_len;
+} wa_pb_whisper_t;
+
+int wa_pb_decode_whisper(const uint8_t *msg, size_t len, wa_pb_whisper_t *out);
+
+typedef struct {
+    uint32_t prekey_id;
+    int has_prekey_id;
+    const uint8_t *base_key;
+    size_t base_key_len;
+    const uint8_t *identity_key;
+    size_t identity_key_len;
+    const uint8_t *message;
+    size_t message_len;
+    uint32_t registration_id;
+    int has_registration_id;
+    uint32_t signed_prekey_id;
+    int has_signed_prekey_id;
+} wa_pb_prekey_t;
+
+int wa_pb_decode_prekey_msg(const uint8_t *msg, size_t len,
+                            wa_pb_prekey_t *out);
+
+/* Extract text from a WAMessage (conversation / extendedTextMessage.text /
+ * deviceSentMessage.message). Returns 0 and copies into out (NUL-terminated)
+ * or -1 when the message carries no plain text. */
+int wa_pb_decode_wamessage_text(const uint8_t *msg, size_t len, char *out,
+                                size_t outcap);
+
 #ifdef __cplusplus
 }
 #endif

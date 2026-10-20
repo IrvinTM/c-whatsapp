@@ -61,6 +61,17 @@ int wa_pbkdf2_sha256(const char *pass, const uint8_t *salt, size_t saltlen,
 int wa_aes_ctr_encrypt(const uint8_t *in, size_t ilen, const uint8_t key[32],
                        const uint8_t iv[16], uint8_t *out, size_t olen);
 
+/* AES-256-CBC encrypt (for Signal WhisperMessage payloads). PKCS#7 padding
+ * is handled by OpenSSL; out must hold ilen+16. Returns bytes or -1. */
+int wa_aes_cbc_encrypt(const uint8_t *in, size_t ilen, const uint8_t key[32],
+                       const uint8_t iv[16], uint8_t *out, size_t olen);
+
+/* AES-256-CBC decrypt (Signal WhisperMessage payloads). PKCS#7 padding is
+ * removed by OpenSSL; out must hold at least ctlen bytes. Returns bytes or
+ * -1 on padding/auth failure. */
+int wa_aes_cbc_decrypt(const uint8_t *in, size_t ilen, const uint8_t key[32],
+                       const uint8_t iv[16], uint8_t *out, size_t olen);
+
 /* Baileys bytesToCrockford (custom alphabet, 5 bytes -> 8 chars + NUL). */
 void wa_crockford5(const uint8_t in[5], char out[9]);
 

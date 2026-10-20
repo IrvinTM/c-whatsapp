@@ -609,8 +609,8 @@ int wa_pb_encode_adv_account(const uint8_t *details, size_t details_len,
 }
 
 int wa_pb_encode_adv_hmac(const uint8_t *details, size_t details_len,
-                          const uint8_t hmac[32], int have_type,
-                          int account_type, wa_pbw_t *out) {
+                           const uint8_t hmac[32], int have_type,
+                           int account_type, wa_pbw_t *out) {
     wa_pbw_init(out);
     if (wa_pbw_bytes(out, 1, details, details_len) ||
         wa_pbw_bytes(out, 2, hmac, 32) ||
@@ -620,3 +620,204 @@ int wa_pb_encode_adv_hmac(const uint8_t *details, size_t details_len,
     }
     return 0;
 }
+
+/* Message{conversation=1} — mirrors proto.Message{conversation} for text. */
+int wa_pb_encode_wamessage_text(const char *text, wa_pbw_t *out) {
+    wa_pbw_init(out);
+    if (!text)
+        return -1;
+    if (wa_pbw_str(out, 1, text)) {
+        wa_pbw_free(out);
+        return -1;
+    }
+    return 0;
+}
+
+/* WhisperMessage{ephemeralKey=1,counter=2,previousCounter=3,ciphertext=4}. */
+int wa_pb_encode_whisper(const uint8_t *eph_33, uint32_t counter,
+                         uint32_t prev_counter, const uint8_t *ct,
+                         size_t ct_len, wa_pbw_t *out) {
+    wa_pbw_init(out);
+    if (!eph_33 || !ct)
+        return -1;
+    if (wa_pbw_bytes(out, 1, eph_33, 33) || wa_pbw_u32(out, 2, counter) ||
+        wa_pbw_u32(out, 3, prev_counter) ||
+        wa_pbw_bytes(out, 4, ct, ct_len)) {
+        wa_pbw_free(out);
+        return -1;
+    }
+    return 0;
+}
+
+/* PreKeyWhisperMessage{preKeyId=1,baseKey=2,identityKey=3,message=4,
+ * registrationId=5,signedPreKeyId=6}. */
+int wa_pb_decode_prekey_msg(const uint8_t *msg, size_t len,
+                            wa_pb_prekey_t *out) {
+    wa_pbr_t r;
+    wa_pbf_t f;
+    int rc;
+    if (!msg || !out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    r.p = msg;
+    r.len = len;
+    r.pos = 0;
+    while ((rc = wa_pbr_next(&r, &f)) == 1) {
+        switch (f.field) {
+        case 1:
+            out->prekey_id = (uint32_t)f.varint;
+            out->has_prekey_id = 1;
+            break;
+        case 2:
+            out->base_key = f.data;
+            out->base_key_len = f.datalen;
+            break;
+        case 3:
+            out->identity_key = f.data;
+            out->identity_key_len = f.datalen;
+            break;
+        case 4:
+            out->message = f.data;
+            out->message_len = f.datalen;
+            break;
+        case 5:
+            out->registration_id = (uint32_t)f.varint;
+            out->has_registration_id = 1;
+            break;
+        case 6:
+            out->signed_prekey_id = (uint32_t)f.varint;
+            out->has_signed_prekey_id = 1;
+            break;
+        default:
+            break;
+        }
+    }
+    if (rc < 0)
+        return -1;
+    if (!out->base_key || !out->identity_key || !out->message)
+        return -1;
+    return 0;
+}
+
+int wa_pb_decode_whisper(const uint8_t *msg, size_t len, wa_pb_whisper_t *out) {
+    wa_pbr_t r;
+    wa_pbf_t f;
+    int rc;
+    if (!msg || !out)
+        return -1;
+    memset(out, 0, sizeof(*out));
+    r.p = msg;
+    r.len = len;
+    r.pos = 0;
+    while ((rc = wa_pbr_next(&r, &f)) == 1) {
+        switch (f.field) {
+        case 1:
+            out->ephemeral_key = f.data;
+            out->ephemeral_key_len = f.datalen;
+            break;
+        case 2:
+            out->counter = (uint32_t)f.varint;
+            out->has_counter = 1;
+            break;
+        case 3:
+            out->previous_counter = (uint32_t)f.varint;
+            out->has_previous_counter = 1;
+            break;
+        case 4:
+            out->ciphertext = f.data;
+            out->ciphertext_len = f.datalen;
+            break;
+        default:
+            break;
+        }
+    }
+    if (rc < 0)
+        return -1;
+    if (!out->ephemeral_key || !out->ciphertext)
+        return -1;
+    return 0;
+}
+
+static int copy_text(const uint8_t *data, size_t len, char *out, size_t outcap) {
+    size_t n = len < outcap - 1 ? len : outcap - 1;
+    if (!outcap)
+        return -1;
+    memcpy(out, data, n);
+    out[n] = '\0';
+    return 0;
+}
+
+int wa_pb_decode_wamessage_text(const uint8_t *msg, size_t len, char *out,
+                                size_t outcap) {
+    wa_pbr_t r;
+    wa_pbf_t f;
+    int rc;
+    const uint8_t *dev_msg = NULL;
+    size_t dev_len = 0;
+    if (!msg || !out || !outcap)
+        return -1;
+    out[0] = '\0';
+    r.p = msg;
+    r.len = len;
+    r.pos = 0;
+    while ((rc = wa_pbr_next(&r, &f)) == 1) {
+        if (f.field == 1 && f.wire == WA_PB_LEN) { /* conversation */
+            return copy_text(f.data, f.datalen, out, outcap);
+        }
+        if (f.field == 6 && f.wire == WA_PB_LEN) { /* extendedTextMessage */
+            wa_pbr_t e;
+            wa_pbf_t g;
+            int grc;
+            e.p = f.data;
+            e.len = f.datalen;
+            e.pos = 0;
+            while ((grc = wa_pbr_next(&e, &g)) == 1) {
+                if (g.field == 1 && g.wire == WA_PB_LEN) /* text */
+                    return copy_text(g.data, g.datalen, out, outcap);
+            }
+        }
+        if (f.field == 31 && f.wire == WA_PB_LEN) { /* deviceSentMessage */
+            wa_pbr_t d;
+            wa_pbf_t g;
+            int drc;
+            d.p = f.data;
+            d.len = f.datalen;
+            d.pos = 0;
+            while ((drc = wa_pbr_next(&d, &g)) == 1) {
+                if (g.field == 2 && g.wire == WA_PB_LEN) { /* message */
+                    dev_msg = g.data;
+                    dev_len = g.datalen;
+                }
+            }
+        }
+    }
+    if (rc < 0)
+        return -1;
+    if (dev_msg)
+        return wa_pb_decode_wamessage_text(dev_msg, dev_len, out, outcap);
+    return -1;
+}
+
+/* PreKeyWhisperMessage{preKeyId=1,baseKey=2,identityKey=3,message=4,
+ * registrationId=5,signedPreKeyId=6}. */
+int wa_pb_encode_prekey_msg(const uint8_t *identity_33,
+                            const uint8_t *base_33,
+                            uint32_t registration_id, uint32_t signed_prekey_id,
+                            int have_prekey_id, uint32_t prekey_id,
+                            const uint8_t *inner, size_t inner_len,
+                            wa_pbw_t *out) {
+    wa_pbw_init(out);
+    if (!identity_33 || !base_33 || !inner)
+        return -1;
+    if ((have_prekey_id ? wa_pbw_u32(out, 1, prekey_id) : 0) ||
+        wa_pbw_bytes(out, 2, base_33, 33) ||
+        wa_pbw_bytes(out, 3, identity_33, 33) ||
+        wa_pbw_bytes(out, 4, inner, inner_len) ||
+        wa_pbw_u32(out, 5, registration_id) ||
+        wa_pbw_u32(out, 6, signed_prekey_id)) {
+        wa_pbw_free(out);
+        return -1;
+    }
+    return 0;
+}
+

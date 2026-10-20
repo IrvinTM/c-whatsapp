@@ -8,7 +8,7 @@ CPPFLAGS += -Iinclude
 LDLIBS  += -lssl -lcrypto -lz -lsodium -lqrencode
 
 BUILD   := build
-LIB_SRC := src/binary.c src/auth.c src/crypto.c src/noise.c src/pb.c src/ws.c src/pairing.c src/socket.c src/send.c src/qr.c
+LIB_SRC := src/binary.c src/auth.c src/crypto.c src/noise.c src/pb.c src/ws.c src/pairing.c src/socket.c src/send.c src/qr.c src/remind.c src/signal.c
 LIB_OBJ := $(patsubst src/%.c,$(BUILD)/%.o,$(LIB_SRC))
 
 all: $(BUILD)/c-whatsapp
@@ -34,11 +34,19 @@ $(BUILD)/test_noise: tests/test_noise.c $(LIB_OBJ) | $(BUILD)
 $(BUILD)/test_pb: tests/test_pb.c $(LIB_OBJ) | $(BUILD)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDFLAGS) $(LDLIBS)
 
-test: all $(BUILD)/test_binary $(BUILD)/test_auth $(BUILD)/test_noise $(BUILD)/test_pb
+$(BUILD)/test_signal: tests/test_signal.c $(LIB_OBJ) | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDFLAGS) $(LDLIBS)
+
+$(BUILD)/test_remind: tests/test_remind.c $(LIB_OBJ) | $(BUILD)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $^ -o $@ $(LDFLAGS) $(LDLIBS)
+
+test: all $(BUILD)/test_binary $(BUILD)/test_auth $(BUILD)/test_noise $(BUILD)/test_pb $(BUILD)/test_signal $(BUILD)/test_remind
 	./$(BUILD)/test_binary
 	./$(BUILD)/test_auth
 	./$(BUILD)/test_noise
 	./$(BUILD)/test_pb
+	./$(BUILD)/test_signal
+	./$(BUILD)/test_remind
 
 clean:
 	rm -rf $(BUILD)
