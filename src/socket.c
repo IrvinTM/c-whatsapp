@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <openssl/rand.h>
 
@@ -1340,6 +1341,14 @@ static int sender_owner(run_t *r, wa_node_t *node, const char *from) {
     return -1;
 }
 
+/* Random 32 bits for nag jitter; weak time/pid fallback if RAND fails. */
+static uint32_t rand32(void) {
+    uint32_t v;
+    if (RAND_bytes((unsigned char *)&v, sizeof(v)) != 1)
+        v = (uint32_t)time(NULL) ^ (uint32_t)getpid();
+    return v;
+}
+
 #define WA_REM_FORMAT                                                     \
     "*reminder <when> <time> <text>*\n"                                   \
     "\xe2\x80\xa2 reminder every day 08:00 take pills\n"                  \
@@ -1349,14 +1358,17 @@ static int sender_owner(run_t *r, wa_node_t *node, const char *from) {
     "\xe2\x80\xa2 reminder tomorrow 09:00 call mom\n"                     \
     "\xe2\x80\xa2 reminder 2026-11-03 14:30 dentist\n"                    \
     "\xe2\x80\xa2 reminder nov 3 2pm dentist\n"                           \
-    "\xe2\x80\xa2 reminder in 20 minutes check the oven"
+    "\xe2\x80\xa2 reminder in 20 minutes check the oven\n"                \
+    "*reminder every <interval> <text>* repeats until you reply *done*\n" \
+    "\xe2\x80\xa2 reminder every 2 hours drink water"
 
 static const char HELP_TEXT[] =
     "\xe2\x8f\xb0 " WA_REM_FORMAT "\n"
     "\n"
     "Times are UTC-6.\n"
     "*list* \xe2\x80\x94 show reminders\n"
-    "*delete 3* \xe2\x80\x94 remove reminder #3";
+    "*delete 3* \xe2\x80\x94 remove reminder #3\n"
+    "*done 3* \xe2\x80\x94 stop a repeating reminder";
 
 static void queue_reply(run_t *r, const char *to, const char *text) {
     if (r->n_replies >= WA_REPLY_SLOTS) {
@@ -1400,6 +1412,8 @@ static void handle_command(run_t *r, const char *from, int owner,
     while (*arg && !isspace((unsigned char)*arg) && k + 1 < sizeof(cmd))
         cmd[k++] = (char)tolower((unsigned char)*arg++);
     cmd[k] = '\0';
+    while (k > 0 && (cmd[k - 1] == '.' || cmd[k - 1] == '!'))
+        cmd[--k] = '\0';
     while (*arg == ' ' || *arg == '\t')
         arg++;
     /* Deliver reminders to the sender's phone number (stable, and the
@@ -1418,25 +1432,36 @@ static void handle_command(run_t *r, const char *from, int owner,
                      "\xe2\x9a\xa0\xef\xb8\x8f Not saved: %s\n\n" WA_REM_FORMAT,
                      err);
         } else {
-            int id = wa_rem_add_spec(r->opts->auth_dir, &spec);
-            if (id < 0) {
+            int id;
+            if (spec.repeat == WA_REM_NAG)
+                spec.next_fire =
+                    wa_rem_nag_jitter(spec.next_fire, now, rand32());
+            id = wa_rem_add_spec(r->opts->auth_dir, &spec);
+            if (id == WA_REM_ERR_NAGS) {
+                snprintf(reply, sizeof(reply),
+                         "\xe2\x9a\xa0\xef\xb8\x8f You already have %d repeating "
+                         "reminders. Settle one with *done N* first.",
+                         WA_REM_NAG_MAX_ACTIVE);
+            } else if (id == WA_REM_ERR_FULL) {
+                snprintf(reply, sizeof(reply),
+                         "\xe2\x9a\xa0\xef\xb8\x8f Reminder list is full; "
+                         "*delete* some first.");
+            } else if (id < 0) {
                 snprintf(reply, sizeof(reply),
                          "\xe2\x9a\xa0\xef\xb8\x8f Could not save the reminder.");
             } else {
                 wa_reminder_t tmp;
                 char when[160];
-                memset(&tmp, 0, sizeof(tmp));
-                tmp.id = id;
-                tmp.days = spec.days;
-                tmp.hour = spec.hour;
-                tmp.min = spec.min;
-                tmp.tz_min = spec.tz_min;
-                tmp.repeat = spec.repeat;
-                snprintf(tmp.date, sizeof(tmp.date), "%s", spec.date);
+                wa_rem_from_spec(&tmp, id, &spec);
                 wa_rem_describe(&tmp, now, when, sizeof(when));
                 snprintf(reply, sizeof(reply),
                          "\xe2\x9c\x85 Reminder #%d set for %s:\n%s", id, when,
                          spec.text);
+                if (spec.repeat == WA_REM_NAG) {
+                    size_t len = strlen(reply);
+                    snprintf(reply + len, sizeof(reply) - len,
+                             "\nReply *done %d* to stop it.", id);
+                }
             }
         }
         queue_reply(r, to, reply);
@@ -1490,6 +1515,73 @@ static void handle_command(run_t *r, const char *from, int owner,
         else
             snprintf(reply, sizeof(reply),
                      "No reminder #%d. Send *list* to see them.", id);
+        queue_reply(r, to, reply);
+        return;
+    }
+    if (!strcmp(cmd, "done") || !strcmp(cmd, "ok") || !strcmp(cmd, "okay") ||
+        !strcmp(cmd, "stop")) {
+        wa_reminder_t *rems = malloc(sizeof(*rems) * WA_REM_MAX);
+        const char *num = *arg == '#' ? arg + 1 : arg;
+        int n = rems ? wa_rem_load(r->opts->auth_dir, rems, WA_REM_MAX) : -1;
+        int id = 0, pick = -1, i;
+        if (n < 0)
+            n = 0;
+        if (isdigit((unsigned char)*num)) {
+            id = atoi(num);
+            for (i = 0; i < n; i++)
+                if (rems[i].id == id)
+                    pick = i;
+            if (pick < 0)
+                snprintf(reply, sizeof(reply),
+                         "No reminder #%d. Send *list* to see them.", id);
+            else if (rems[pick].repeat != WA_REM_NAG) {
+                snprintf(reply, sizeof(reply),
+                         "#%d is a scheduled reminder, not a repeating one. "
+                         "Send *delete %d* to remove it.",
+                         id, id);
+                pick = -1;
+            }
+        } else {
+            int mine = 0;
+            for (i = 0; i < n; i++)
+                if (rems[i].repeat == WA_REM_NAG && !strcmp(rems[i].to, to)) {
+                    pick = i;
+                    mine++;
+                }
+            if (mine == 0) {
+                snprintf(reply, sizeof(reply),
+                         "Nothing is nagging you right now \xf0\x9f\x99\x82");
+                pick = -1;
+            } else if (mine > 1) {
+                size_t off = (size_t)snprintf(reply, sizeof(reply), "Which one?");
+                for (i = 0; i < n; i++) {
+                    if (rems[i].repeat != WA_REM_NAG || strcmp(rems[i].to, to))
+                        continue;
+                    if (off + 32 + strlen(rems[i].text) >= sizeof(reply))
+                        break;
+                    off += (size_t)snprintf(reply + off, sizeof(reply) - off,
+                                            "\n*done %d* %s", rems[i].id,
+                                            rems[i].text);
+                }
+                pick = -1;
+            }
+        }
+        if (pick >= 0) {
+            if (wa_rem_del(r->opts->auth_dir, rems[pick].id) == 0) {
+                size_t off = (size_t)snprintf(reply, sizeof(reply),
+                                              "\xe2\x9c\x85 #%d done: %s",
+                                              rems[pick].id, rems[pick].text);
+                if (rems[pick].sent > 0 && off < sizeof(reply))
+                    snprintf(reply + off, sizeof(reply) - off,
+                             " (after %d reminder%s)", rems[pick].sent,
+                             rems[pick].sent == 1 ? "" : "s");
+            } else {
+                snprintf(reply, sizeof(reply),
+                         "No reminder #%d. Send *list* to see them.",
+                         rems[pick].id);
+            }
+        }
+        free(rems);
         queue_reply(r, to, reply);
         return;
     }
@@ -1689,11 +1781,47 @@ static void daemon_poll(run_t *r) {
     /* Heap, not stack: the array is large and stack probing would keep all
      * of it resident for the life of the process. */
     wa_reminder_t *rems = malloc(sizeof(*rems) * WA_REM_MAX);
-    int n, i;
+    int n, i, nag_done = 0;
     if (!rems)
         return;
     n = wa_rem_load(r->opts->auth_dir, rems, WA_REM_MAX);
     for (i = 0; i < n; i++) {
+        if (rems[i].repeat == WA_REM_NAG) {
+            char msg[WA_REM_TEXT_MAX + 256];
+            int rc;
+            if (nag_done || !wa_rem_nag_due(&rems[i], now))
+                continue;
+            nag_done = 1; /* at most one nag per poll */
+            rlog(r, "nag due id=%d to=%s text='%s' sent=%d", rems[i].id,
+                 rems[i].to, rems[i].text, rems[i].sent);
+            wa_rem_nag_text(&rems[i], msg, sizeof(msg));
+            if (do_send_text(r, rems[i].to, msg) == 0) {
+                rc = wa_rem_nag_advance(
+                    r->opts->auth_dir, rems[i].id, rems[i].next_fire,
+                    wa_rem_nag_next(&rems[i], now, rand32()),
+                    rems[i].sent + 1);
+                if (rc == 0)
+                    rlog(r, "nag sent id=%d (%d so far), rescheduled",
+                         rems[i].id, rems[i].sent + 1);
+                else if (rc == 1)
+                    rlog(r, "nag finished id=%d after %d reminders",
+                         rems[i].id, rems[i].sent + 1);
+                else
+                    rlog(r, "nag sent id=%d but it was settled meanwhile",
+                         rems[i].id);
+            } else {
+                wa_rem_nag_advance(r->opts->auth_dir, rems[i].id,
+                                   rems[i].next_fire, now + WA_REM_NAG_RETRY_S,
+                                   rems[i].sent);
+                rlog(r, "nag failed id=%d (will retry in %ds)", rems[i].id,
+                     WA_REM_NAG_RETRY_S);
+            }
+            if (r->outcome >= 0) {
+                free(rems);
+                return;
+            }
+            continue;
+        }
         for (int back = 0; back < 2; back++) {
             time_t when = now - back * 60;
             long long minute = (long long)when / 60;

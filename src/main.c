@@ -15,7 +15,7 @@
 #include "wa_remind.h"
 #include "wa_socket.h"
 
-#define CWA_VERSION "0.7.0"
+#define CWA_VERSION "0.8.0"
 
 static void usage(const char *argv0) {
     printf("c-whatsapp %s — WhatsApp Linked-Device client in C (Baileys port)\n\n", CWA_VERSION);
@@ -40,7 +40,7 @@ static void usage(const char *argv0) {
     printf("  --remind-add     add weekly reminder: DAYS=Mon-Fri|* HH:MM TO TEXT\n");
     printf("  --remind-list    list reminders\n");
     printf("  --remind-del ID  delete reminder\n");
-    printf("  --daemon         keep running, send due reminders (polls 15s)\n");
+    printf("  --daemon         keep running, send due and repeating (nag) reminders (polls 15s)\n");
     printf("  --listen         stay online, decrypt messages, fire reminders, handle /reminder\n");
     printf("  --read-receipts  send read receipts for inbound messages (listen/daemon)\n");
     printf("  --allow NUMS     numbers allowed to manage reminders over chat\n");
@@ -171,10 +171,12 @@ int main(int argc, char **argv) {
 
     /* Local reminder ops (no connection needed). */
     if (want_list) {
-        wa_reminder_t rems[WA_REM_MAX];
-        int n = wa_rem_load(auth_dir, rems, WA_REM_MAX);
+        /* Heap: the struct is large (text buffers x WA_REM_MAX). */
+        wa_reminder_t *rems = malloc(sizeof(*rems) * WA_REM_MAX);
+        int n = rems ? wa_rem_load(auth_dir, rems, WA_REM_MAX) : -1;
         if (n < 0) {
             fprintf(stderr, "cannot read reminders\n");
+            free(rems);
             return 1;
         }
         if (!n)
@@ -185,6 +187,7 @@ int main(int argc, char **argv) {
             printf("%d\t%s\t%s\t%s\n", rems[i].id, sched, rems[i].to,
                    rems[i].text);
         }
+        free(rems);
         return 0;
     }
     if (want_del >= 0) {

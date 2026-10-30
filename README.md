@@ -32,6 +32,8 @@ via `tools/gen_tokens.py`).
       receipts, delivery receipts (and optional read receipts with
       `--read-receipts`).
 - [x] Reminders: once/daily/weekly schedules, dates, fixed UTC-6 offset,
+      repeating "nag" reminders (`reminder every hour take pills`, re-sent
+      every interval with +-5 min random jitter until you reply `done N`),
       CLI management, chat requests in a fixed format (`reminder every sat
       1pm class`, UTC-6) restricted to `CWA_ALLOW` numbers, `--daemon` and
       `--listen` modes. See [deploy/README.md](deploy/README.md) for

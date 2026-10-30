@@ -114,9 +114,68 @@ text can contain dates and times safely; line breaks become spaces. A message
 that doesn't fit the format is not saved, and the reply says why. Reminders
 created in chat are delivered to the sender's number.
 
-The daemon reloads `reminders.tsv` every 15 seconds
+Repeating (nag) reminders are described in the next section. The daemon
+reloads `reminders.tsv` every 15 seconds
 and also checks the previous minute, so a slow send does not make it miss its
 slot.
 
 `--timeout` is optional for `--daemon` and `--listen`; they run until stopped
 by default. Use `--timeout SECS` only for a bounded test run.
+
+## 7. Repeating "nag" reminders
+
+A nag is re-sent every interval until you settle it:
+
+```text
+reminder every <interval> [until done] <text>
+reminder hourly <text>
+
+reminder every hour take pills
+reminder every 30 minutes stretch
+reminder every 2 hours drink water
+reminder every 1h30m until done check the oven
+reminder hourly stand up
+```
+
+Intervals: `hour`, `half hour`, `30 minutes`, `2h`, `1h30m`, `90m`; from
+15 minutes to 24 hours. `until done` is optional and changes nothing. No
+clock time or date is accepted: a nag starts when you create it, and the
+first message arrives one interval later (not immediately).
+
+Settle a nag from the same chat with `done N`, `ok N`, `okay N` or `stop N`
+(`N` is the reminder number from the confirmation, `#3` also works). A bare
+`done` settles your only nag, or lists yours if you have several. `delete N`
+works too. `done N` on a normal reminder is refused and points at `delete`.
+
+Timing and limits:
+
+- **Jitter.** Each gap is the interval plus or minus a random 0 to 5 minutes
+  (never closer than 5 minutes to the previous message), so the messages are
+  not robotically regular. The gap is computed from the scheduled time, so
+  polling lag does not accumulate.
+- **Caps.** At most 24 messages per nag; the 24th says it is the last
+  reminder and the nag then removes itself. At most 5 nags are active; a new
+  one is refused until you settle one.
+- **Downtime.** If the daemon was down or offline when a message was due, it
+  sends at most one catch-up message after it returns, then reschedules from
+  that moment. A failed send is retried after 2 minutes.
+- **Time zone.** Times shown are still UTC-6. There are no quiet hours: nags
+  send around the clock.
+
+Storage is `reminders.tsv` format version 3. A nag line adds three fields
+after the text:
+
+```text
+id  date  HH:MM  tz  nag  -  to  text  interval_min  next_fire_epoch  sent
+1   2026-10-30  10:15  -360  nag  -  15551234567@s.whatsapp.net  take pills  60  1793000000  0
+```
+
+`date` and `HH:MM` are the creation time; `next_fire_epoch` is the UTC time of
+the next send and `sent` the number of messages so far. Fields are
+tab-separated. Because the daemon and the CLI both rewrite this file, they
+take an exclusive `flock` on `reminders.lock` next to `reminders.tsv`; leave
+that file in place.
+
+Downgrading: an older binary skips nag lines it does not understand, and its
+`--remind-del` or chat `delete` rewrites the file without them, so nags would
+be lost. Settle or note your nags before rolling back.
