@@ -11,7 +11,7 @@ Group=c-whatsapp
 StateDirectory=c-whatsapp
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/c-whatsapp
-# CWA_ALLOW=15551234567 (who may manage reminders over chat), CWA_TZ=UTC-6
+# CWA_ALLOW=15551234567 (who may manage reminders over chat)
 EnvironmentFile=-/etc/c-whatsapp/env
 ExecStart=/usr/local/bin/c-whatsapp --auth-dir /var/lib/c-whatsapp --daemon --timeout 0
 Restart=always

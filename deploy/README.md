@@ -57,13 +57,11 @@ anyone else are ignored (and logged).
 
 ```sh
 sudo install -d -m 755 /etc/c-whatsapp
-printf 'CWA_ALLOW=15551234567\nCWA_TZ=UTC-6\n' | \
+printf 'CWA_ALLOW=15551234567\n' | \
     sudo install -m 600 /dev/stdin /etc/c-whatsapp/env
 ```
 
-`CWA_ALLOW` is comma-separated digits with country code. `CWA_TZ` is the
-default timezone for chat requests (a fixed offset; send `tz UTC-5` from the
-phone to change it later, e.g. for daylight saving).
+`CWA_ALLOW` is comma-separated digits with country code.
 
 ## 5. Install and start the unit
 
@@ -92,25 +90,29 @@ sudo -u c-whatsapp /usr/local/bin/c-whatsapp \
     --auth-dir /var/lib/c-whatsapp --remind-list
 ```
 
-From an allowed phone, just message the bot account in plain words:
+From an allowed phone, message the bot account using this format:
 
 ```text
-remind me in 20 minutes to check the oven
-remind me tomorrow at 9am to call mom
-remind me friday evening to pay rent
-remind me nov 3 at 14:30 dentist
-remind me every weekday at 7:50 class starts
-remind me every mon and wed at 6pm gym
+reminder <when> <time> <text>
+
+reminder every day 08:00 take pills
+reminder every sat 1pm class
+reminder every mon,wed 18:30 gym
+reminder every weekday 7:50am class
+reminder tomorrow 09:00 call mom
+reminder 2026-11-03 14:30 dentist
+reminder nov 3 2pm dentist
+reminder in 20 minutes check the oven
 list
 delete 3
-tz UTC-6
 help
 ```
 
-The daemon replies with exactly what it understood ("Reminder #4 set for
-tomorrow (Sat 31 Oct) at 09:00 UTC-6"), so a misread time is easy to spot
-and `delete` it. The older `/reminder 07:50 Mon-Fri text` form is understood
-too. Reminders created in chat are delivered to the sender's number.
+All times are **UTC-6** (`WA_REM_TZ` in `include/wa_remind.h`), whatever the
+server's clock says. Everything after the time is kept as typed, so pasted
+text can contain dates and times safely; line breaks become spaces. A message
+that doesn't fit the format is not saved, and the reply says why. Reminders
+created in chat are delivered to the sender's number.
 
 The daemon reloads `reminders.tsv` every 15 seconds
 and also checks the previous minute, so a slow send does not make it miss its
