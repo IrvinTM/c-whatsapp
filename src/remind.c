@@ -275,17 +275,21 @@ int wa_rem_load(const char *auth_dir, wa_reminder_t *out, int cap) {
 
 int wa_rem_add_spec(const char *auth_dir, const wa_rem_spec_t *s) {
     char path[512], ds[64];
-    wa_reminder_t cur[WA_REM_MAX];
+    wa_reminder_t *cur;
     int n, nid = 1;
     FILE *f;
     if (!s || !s->to[0] || !s->text[0])
         return -1;
     if (s->hour < 0 || s->hour > 23 || s->min < 0 || s->min > 59)
         return -1;
+    cur = malloc(sizeof(*cur) * WA_REM_MAX);
+    if (!cur)
+        return -1;
     n = wa_rem_load(auth_dir, cur, WA_REM_MAX);
     for (int i = 0; i < n; i++)
         if (cur[i].id >= nid)
             nid = cur[i].id + 1;
+    free(cur);
     rem_path(auth_dir, path);
     f = fopen(path, "a");
     if (!f)
@@ -320,20 +324,26 @@ int wa_rem_add(const char *auth_dir, unsigned days, int hour, int min,
 
 int wa_rem_del(const char *auth_dir, int id) {
     char path[512], tmp[520];
-    wa_reminder_t cur[WA_REM_MAX];
+    wa_reminder_t *cur = malloc(sizeof(*cur) * WA_REM_MAX);
     int n, found = 0;
     FILE *f;
+    if (!cur)
+        return -1;
     n = wa_rem_load(auth_dir, cur, WA_REM_MAX);
     for (int i = 0; i < n; i++)
         if (cur[i].id == id)
             found = 1;
-    if (!found)
+    if (!found) {
+        free(cur);
         return -1;
+    }
     rem_path(auth_dir, path);
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
     f = fopen(tmp, "w");
-    if (!f)
+    if (!f) {
+        free(cur);
         return -1;
+    }
     for (int i = 0; i < n; i++) {
         char ds[64];
         if (cur[i].id == id)
@@ -349,6 +359,7 @@ int wa_rem_del(const char *auth_dir, int id) {
     }
     fclose(f);
     rename(tmp, path);
+    free(cur);
     return 0;
 }
 
@@ -992,6 +1003,10 @@ int wa_rem_parse_request(const char *text, time_t now, int tz_min,
                 out->text[off++] = *p;
             }
         }
+        if (*p)
+            return nl_set_err(err, errcap,
+                              "that text is too long, the limit is about "
+                              "2000 characters");
         while (off && out->text[off - 1] == ' ')
             off--;
         out->text[off] = '\0';
