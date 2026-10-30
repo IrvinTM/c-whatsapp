@@ -1317,20 +1317,23 @@ static int sender_owner(run_t *r, wa_node_t *node, const char *from) {
     return -1;
 }
 
+#define WA_REM_FORMAT                                                     \
+    "*reminder <when> <time> <text>*\n"                                   \
+    "\xe2\x80\xa2 reminder every day 08:00 take pills\n"                  \
+    "\xe2\x80\xa2 reminder every sat 1pm class\n"                         \
+    "\xe2\x80\xa2 reminder every mon,wed 18:30 gym\n"                     \
+    "\xe2\x80\xa2 reminder every weekday 7:50am class\n"                  \
+    "\xe2\x80\xa2 reminder tomorrow 09:00 call mom\n"                     \
+    "\xe2\x80\xa2 reminder 2026-11-03 14:30 dentist\n"                    \
+    "\xe2\x80\xa2 reminder nov 3 2pm dentist\n"                           \
+    "\xe2\x80\xa2 reminder in 20 minutes check the oven"
+
 static const char HELP_TEXT[] =
-    "\xe2\x8f\xb0 *Reminders*\n"
-    "Just write what you need, for example:\n"
-    "\xe2\x80\xa2 remind me in 20 minutes to check the oven\n"
-    "\xe2\x80\xa2 remind me tomorrow at 9am to call mom\n"
-    "\xe2\x80\xa2 remind me friday evening to pay rent\n"
-    "\xe2\x80\xa2 remind me nov 3 at 14:30 dentist\n"
-    "\xe2\x80\xa2 remind me every day at 8pm to take pills\n"
-    "\xe2\x80\xa2 remind me every weekday at 7:50 class starts\n"
-    "\xe2\x80\xa2 remind me every mon and wed at 6pm gym\n"
+    "\xe2\x8f\xb0 " WA_REM_FORMAT "\n"
     "\n"
+    "Times are UTC-6.\n"
     "*list* \xe2\x80\x94 show reminders\n"
-    "*delete 3* \xe2\x80\x94 remove reminder #3\n"
-    "*tz UTC-6* \xe2\x80\x94 set your timezone";
+    "*delete 3* \xe2\x80\x94 remove reminder #3";
 
 static void queue_reply(run_t *r, const char *to, const char *text) {
     if (r->n_replies >= 4) {
@@ -1366,7 +1369,6 @@ static void handle_command(run_t *r, const char *from, int owner,
     const char *body = text, *arg;
     char reply[1400], cmd[24], to[WA_SEND_JID_MAX];
     size_t k = 0;
-    int tz = wa_rem_tz_load(r->opts->auth_dir, r->opts->tz_min);
     time_t now = time(NULL);
 
     while (*body == ' ' || *body == '\t' || *body == '\n')
@@ -1387,9 +1389,10 @@ static void handle_command(run_t *r, const char *from, int owner,
     if (wa_rem_is_request(body)) {
         wa_rem_spec_t spec;
         char err[256];
-        if (wa_rem_parse_natural(body, now, tz, to, &spec, err, sizeof(err))) {
+        if (wa_rem_parse_request(body, now, WA_REM_TZ, to, &spec, err,
+                                 sizeof(err))) {
             snprintf(reply, sizeof(reply),
-                     "\xf0\x9f\xa4\x94 Sorry, %s\n\nSend *help* for examples.",
+                     "\xe2\x9a\xa0\xef\xb8\x8f Not saved: %s\n\n" WA_REM_FORMAT,
                      err);
         } else {
             int id = wa_rem_add_spec(r->opts->auth_dir, &spec);
@@ -1452,24 +1455,6 @@ static void handle_command(run_t *r, const char *from, int owner,
         else
             snprintf(reply, sizeof(reply),
                      "No reminder #%d. Send *list* to see them.", id);
-        queue_reply(r, to, reply);
-        return;
-    }
-    if (!strcmp(cmd, "tz") || !strcmp(cmd, "timezone")) {
-        int v;
-        if (*arg && wa_rem_tz_parse(arg, &v) == 0) {
-            if (wa_rem_tz_save(r->opts->auth_dir, v) == 0)
-                tz = v;
-            else
-                arg = "";
-        } else if (*arg) {
-            queue_reply(r, to,
-                              "Use an offset like *tz UTC-6* or *tz UTC+5:30*");
-            return;
-        }
-        snprintf(reply, sizeof(reply), "\xf0\x9f\x8c\x8d Timezone %s UTC%c%d:%02d",
-                 *arg ? "set to" : "is", tz < 0 ? '-' : '+', abs(tz) / 60,
-                 abs(tz) % 60);
         queue_reply(r, to, reply);
         return;
     }

@@ -72,7 +72,6 @@ typedef struct {
     /* Comma-separated phone numbers allowed to manage reminders over chat
      * (CWA_ALLOW). NULL/empty disables chat commands entirely. */
     const char *allow;
-    int tz_min; /* default timezone for chat requests (minutes east of UTC) */
     int connect_timeout_ms; /* 0 = 20000 */
     int run_timeout_ms; /* 0 = no overall timeout */
 } wa_conn_opts_t;

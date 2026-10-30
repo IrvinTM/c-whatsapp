@@ -22,7 +22,7 @@ static void nl(const char *text, int want_ok, const char *date, int h, int m,
                int repeat, unsigned days, const char *want_text) {
     wa_rem_spec_t s;
     char err[256] = "", msg[512];
-    int rc = wa_rem_parse_natural(text, NOW_FRI, -360, "+1555", &s, err,
+    int rc = wa_rem_parse_request(text, NOW_FRI, -360, "+1555", &s, err,
                                   sizeof(err));
     int good;
     if (!want_ok) {
@@ -183,74 +183,77 @@ int main(void) {
         }
     }
 
-    /* natural-language requests */
+    /* chat requests: reminder WHEN TIME TEXT */
     ok(wa_rem_is_request("Remind me at 9 to x"), "trigger: Remind me");
     ok(wa_rem_is_request("/reminder 09:00 x"), "trigger: /reminder");
     ok(!wa_rem_is_request("hello there"), "no trigger: hello");
-    nl("remind me tomorrow at 9am to call mom", 1, "2026-10-31", 9, 0,
-       WA_REM_ONCE, 0, "call mom");
-    nl("Remind me to call mom tomorrow at 9:30 pm", 1, "2026-10-31", 21, 30,
-       WA_REM_ONCE, 0, "call mom");
-    nl("remind me in 20 minutes to take the pizza out", 1, "2026-10-30", 10,
-       36, WA_REM_ONCE, 0, "take the pizza out");
-    nl("remind me in 2h stretch", 1, "2026-10-30", 12, 16, WA_REM_ONCE, 0,
-       "stretch");
-    nl("remind me in 1h30m stretch", 1, "2026-10-30", 11, 46, WA_REM_ONCE, 0,
-       "stretch");
-    nl("remind me in an hour and a half to leave", 1, "2026-10-30", 11, 46,
-       WA_REM_ONCE, 0, "leave");
-    nl("remind me in half an hour tea", 1, "2026-10-30", 10, 46, WA_REM_ONCE,
-       0, "tea");
-    nl("remind me at 8 to stretch", 1, "2026-10-31", 8, 0, WA_REM_ONCE, 0,
-       "stretch"); /* 08:00 already passed today -> tomorrow */
-    nl("remind me at 17:45 to leave", 1, "2026-10-30", 17, 45, WA_REM_ONCE,
-       0, "leave");
-    nl("remind me at noon lunch", 1, "2026-10-30", 12, 0, WA_REM_ONCE, 0,
-       "lunch");
-    nl("remind me tonight at 8 to call dad", 1, "2026-10-30", 20, 0,
-       WA_REM_ONCE, 0, "call dad");
-    nl("remind me tomorrow morning to water plants", 1, "2026-10-31", 9, 0,
-       WA_REM_ONCE, 0, "water plants");
-    nl("remind me on monday at 10 standup", 1, "2026-11-02", 10, 0,
-       WA_REM_ONCE, 0, "standup");
-    nl("remind me friday at 9 review", 1, "2026-11-06", 9, 0, WA_REM_ONCE, 0,
-       "review"); /* today is Fri and 09:00 passed -> next week */
-    nl("remind me every day at 7am to take my pills", 1, NULL, 7, 0,
-       WA_REM_DAILY, 0, "take my pills");
-    nl("remind me daily at 21:00 journal", 1, NULL, 21, 0, WA_REM_DAILY, 0,
+    nl("reminder every day 08:00 take pills", 1, NULL, 8, 0, WA_REM_DAILY, 0,
+       "take pills");
+    nl("Reminder daily 8pm journal", 1, NULL, 20, 0, WA_REM_DAILY, 0,
        "journal");
-    nl("remind me every weekday at 7:50 class starts", 1, NULL, 7, 50,
+    nl("reminder every saturday 13:00 class", 1, NULL, 13, 0, WA_REM_WEEKLY,
+       0x40, "class");
+    nl("reminder every sat at 1 pm class", 1, NULL, 13, 0, WA_REM_WEEKLY,
+       0x40, "class");
+    nl("Remind me every sat at 1 pm class", 1, NULL, 13, 0, WA_REM_WEEKLY,
+       0x40, "class");
+    nl("reminder saturdays 10:00 call grandma", 1, NULL, 10, 0, WA_REM_WEEKLY,
+       0x40, "call grandma");
+    nl("reminder every weekday 7:50am class starts", 1, NULL, 7, 50,
        WA_REM_WEEKLY, 0x3E, "class starts");
-    nl("remind me every monday and wednesday at 6pm gym", 1, NULL, 18, 0,
-       WA_REM_WEEKLY, 0x0A, "gym");
-    nl("remind me every mon, wed and fri at 6:30 run", 1, NULL, 6, 30,
+    nl("reminder every weekend 10am sleep in", 1, NULL, 10, 0, WA_REM_WEEKLY,
+       0x41, "sleep in");
+    nl("reminder every mon,wed 18:30 gym", 1, NULL, 18, 30, WA_REM_WEEKLY,
+       0x0A, "gym");
+    nl("reminder every mon, wed and fri 6:30am run", 1, NULL, 6, 30,
        WA_REM_WEEKLY, 0x2A, "run");
-    nl("remind me on sundays at 10 call grandma", 1, NULL, 10, 0,
-       WA_REM_WEEKLY, 0x01, "call grandma");
-    nl("remind me every weekend at 10am sleep in", 1, NULL, 10, 0,
-       WA_REM_WEEKLY, 0x41, "sleep in");
-    nl("remind me every week to clean", 1, NULL, 9, 0, WA_REM_WEEKLY, 0x20,
-       "clean");
-    nl("remind me nov 3 at 14:30 dentist", 1, "2026-11-03", 14, 30,
-       WA_REM_ONCE, 0, "dentist");
-    nl("remind me on the 3rd of december to renew passport", 1, "2026-12-03",
-       9, 0, WA_REM_ONCE, 0, "renew passport");
-    nl("remind me 3rd of december to renew passport", 1, "2026-12-03", 9, 0,
-       WA_REM_ONCE, 0, "renew passport");
-    nl("remind me on 2027-01-15 at 8:00 pay taxes", 1, "2027-01-15", 8, 0,
+    nl("reminder every mon-fri 07:00 standup", 1, NULL, 7, 0, WA_REM_WEEKLY,
+       0x3E, "standup");
+    nl("reminder today 17:45 leave", 1, "2026-10-30", 17, 45, WA_REM_ONCE, 0,
+       "leave");
+    nl("reminder tomorrow 9am call mom", 1, "2026-10-31", 9, 0, WA_REM_ONCE,
+       0, "call mom");
+    nl("reminder mon 10:00 standup", 1, "2026-11-02", 10, 0, WA_REM_ONCE, 0,
+       "standup");
+    nl("reminder fri 09:00 review", 1, "2026-11-06", 9, 0, WA_REM_ONCE, 0,
+       "review"); /* today is Fri and 09:00 passed -> next week */
+    nl("reminder 2027-01-15 08:00 pay taxes", 1, "2027-01-15", 8, 0,
        WA_REM_ONCE, 0, "pay taxes");
-    nl("remind me jan 2 happy new year", 1, "2027-01-02", 9, 0, WA_REM_ONCE,
-       0, "happy new year");
-    nl("/reminder tomorrow 9am buy milk", 1, "2026-10-31", 9, 0, WA_REM_ONCE,
-       0, "buy milk");
-    nl("/reminder 07:50 Mon-Fri class", 1, NULL, 7, 50, WA_REM_WEEKLY, 0x3E,
-       "class");
-    nl("/reminder 2026-11-21 07:50 (UTC-6) once standup", 1, "2026-11-21", 7,
-       50, WA_REM_ONCE, 0, "standup");
-    nl("remind me to buy milk", 0, NULL, 0, 0, 0, 0, NULL);
-    nl("remind me tomorrow at 9", 0, NULL, 0, 0, 0, 0, NULL);
-    nl("remind me today at 8 x", 0, NULL, 0, 0, 0, 0, NULL);
-    nl("remind me on 2026-01-01 at 8 x", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder nov 3 2pm dentist", 1, "2026-11-03", 14, 0, WA_REM_ONCE, 0,
+       "dentist");
+    nl("reminder 3 nov 14:30 dentist", 1, "2026-11-03", 14, 30, WA_REM_ONCE,
+       0, "dentist");
+    nl("reminder jan 2 09:00 new year", 1, "2027-01-02", 9, 0, WA_REM_ONCE, 0,
+       "new year");
+    nl("reminder in 20 minutes check the oven", 1, "2026-10-30", 10, 36,
+       WA_REM_ONCE, 0, "check the oven");
+    nl("Remind me in 1 minute text gf", 1, "2026-10-30", 10, 17, WA_REM_ONCE,
+       0, "text gf");
+    nl("reminder in 2h stretch", 1, "2026-10-30", 12, 16, WA_REM_ONCE, 0,
+       "stretch");
+    nl("reminder in 1h30m stretch", 1, "2026-10-30", 11, 46, WA_REM_ONCE, 0,
+       "stretch");
+    nl("reminder in 3 days renew", 1, "2026-11-02", 10, 16, WA_REM_ONCE, 0,
+       "renew");
+    /* the text is never searched for dates, times or words */
+    nl("reminder every sat 13:00 Saturday, October 31 \xe2\x80\xa2 1:00 tomorrow "
+       "Or dial: +503 2113",
+       1, NULL, 13, 0, WA_REM_WEEKLY, 0x40,
+       "Saturday, October 31 \xe2\x80\xa2 1:00 tomorrow Or dial: +503 2113");
+    nl("reminder every sat 13:00 line one\nline two\n", 1, NULL, 13, 0,
+       WA_REM_WEEKLY, 0x40, "line one line two");
+    nl("reminder to buy milk", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("remind me to call mom tomorrow at 9", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder tomorrow call mom", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder tomorrow 9 eggs", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder tomorrow 09:00", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder every sunny 09:00 x", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder every sat", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder today 08:00 x", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder 2026-01-01 08:00 x", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder feb 30 08:00 x", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder in five minutes x", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder", 0, NULL, 0, 0, 0, 0, NULL);
     {
         wa_reminder_t r;
         char d[128];
@@ -266,9 +269,7 @@ int main(void) {
         r.date[0] = '\0';
         wa_rem_describe(&r, NOW_FRI, d, sizeof(d));
         ok(!strcmp(d, "every weekday at 09:00 UTC-6"), d);
-        ok(wa_rem_tz_load(dir, 42) == 42, "tz default when unset");
-        ok(wa_rem_tz_save(dir, -360) == 0 && wa_rem_tz_load(dir, 0) == -360,
-           "tz save/load");
+        ok(WA_REM_TZ == -360, "fixed timezone is UTC-6");
     }
 
     printf("%s\n", fails ? "some remind tests failed" : "all remind tests passed");
