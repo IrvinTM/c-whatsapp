@@ -21,7 +21,7 @@ extern "C" {
 #endif
 
 #define WA_REM_TO_MAX 160
-#define WA_REM_TEXT_MAX 512
+#define WA_REM_TEXT_MAX 2048
 #define WA_REM_MAX 256
 #define WA_REM_DATE_LEN 10
 /* Every new reminder uses this fixed offset (minutes east of UTC): UTC-6. */

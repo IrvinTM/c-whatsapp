@@ -242,6 +242,16 @@ int main(void) {
        "Saturday, October 31 \xe2\x80\xa2 1:00 tomorrow Or dial: +503 2113");
     nl("reminder every sat 13:00 line one\nline two\n", 1, NULL, 13, 0,
        WA_REM_WEEKLY, 0x40, "line one line two");
+    { /* long pasted text: kept whole up to the limit, refused beyond it */
+        static char big[6000], want[3000];
+        memset(want, 'x', 2000);
+        want[2000] = '\0';
+        snprintf(big, sizeof(big), "reminder every sat 13:00 %s", want);
+        nl(big, 1, NULL, 13, 0, WA_REM_WEEKLY, 0x40, want);
+        memset(big + 24, 'x', 3000);
+        big[3024] = '\0';
+        nl(big, 0, NULL, 0, 0, 0, 0, NULL);
+    }
     nl("reminder to buy milk", 0, NULL, 0, 0, 0, 0, NULL);
     nl("remind me to call mom tomorrow at 9", 0, NULL, 0, 0, 0, 0, NULL);
     nl("reminder tomorrow call mom", 0, NULL, 0, 0, 0, 0, NULL);

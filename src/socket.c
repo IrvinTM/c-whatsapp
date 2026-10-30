@@ -47,6 +47,10 @@ void wa_conn_next_tag(wa_conn_t *c, char out[WA_TAG_MAX]) {
 
 /* ---------------- runner internals ---------------- */
 
+/* Queued chat replies. A list can use several slots. */
+#define WA_REPLY_MAX 4096
+#define WA_REPLY_SLOTS 6
+
 /* Bounded bookkeeping for inbound retry requests (per message id). */
 #define RETRY_SLOTS 32
 #define RETRY_MAX 3
@@ -90,8 +94,8 @@ typedef struct {
      * main loop with the full send path (all devices, any session state). */
     struct {
         char to[160];
-        char text[1400];
-    } replies[4];
+        char text[WA_REPLY_MAX];
+    } replies[WA_REPLY_SLOTS];
     int n_replies;
 } run_t;
 
@@ -144,6 +148,7 @@ static int send_frame(run_t *r, const uint8_t *payload, size_t plen);
 /* Inbound <message> decryption + command handling (defined after senders). */
 static int handle_message(run_t *r, wa_node_t *node);
 static void send_node_now(run_t *r, wa_node_t *node);
+static void send_ack(run_t *r, wa_node_t *node);
 
 static int send_frame(run_t *r, const uint8_t *payload, size_t plen) {
     uint8_t *out = malloc(plen + 16 + 128); /* tag + max intro */
@@ -373,6 +378,19 @@ static int on_node(run_t *r, wa_node_t *node) {
             rlog(r, "saved edge routing info (%zu bytes)",
                  ri->content.bytes.len);
         }
+        if (wa_node_get_child(node, "offline_preview")) {
+            /* Queued stanzas must be requested; until the batch is drained
+             * the server holds back everything else, new messages included. */
+            wa_node_t *ib = wa_node_new("ib");
+            wa_node_t *batch = wa_node_new("offline_batch");
+            if (ib && batch && !wa_node_add_attr(batch, "count", "100") &&
+                !wa_node_add_child(ib, batch)) {
+                send_node_now(r, ib);
+            } else {
+                wa_node_free(batch);
+                wa_node_free(ib);
+            }
+        }
         return 0;
     }
     if (!strcmp(node->tag, "success")) {
@@ -439,18 +457,8 @@ static int frame_cb(const uint8_t *frame, size_t len, void *user) {
         /* Ack delivery receipts / notifications so the server drains its
          * offline queue instead of replaying them on every reconnect. */
         if (!strcmp(node->tag, "receipt") ||
-            !strcmp(node->tag, "notification")) {
-            const char *from = wa_node_get_attr(node, "from");
-            if (id && from) {
-                wa_node_t *ack = wa_node_new("ack");
-                if (ack && !(wa_node_add_attr(ack, "id", id) ||
-                             wa_node_add_attr(ack, "to", from) ||
-                             wa_node_add_attr(ack, "class", node->tag)))
-                    send_node_now(r, ack); /* takes ownership */
-                else
-                    wa_node_free(ack);
-            }
-        }
+            !strcmp(node->tag, "notification"))
+            send_ack(r, node);
     }
     /* pending query match takes priority over dispatch */
     if (r->want_id[0] && !strcmp(node->tag, "iq")) {
@@ -1182,6 +1190,34 @@ fail:
 
 /* Encode + send a node without waiting for a reply (safe to call from inside
  * the receive path). Takes ownership of node. */
+/* Ack an inbound stanza so the server stops retrying it. Mirrors Baileys
+ * sendMessageAck: receipts and notifications must echo their type, or the
+ * server never counts them as acked, keeps them queued and eventually closes
+ * the stream with <stream:error><ack .../></stream:error>. */
+static void send_ack(run_t *r, wa_node_t *node) {
+    const char *id = wa_node_get_attr(node, "id");
+    const char *from = wa_node_get_attr(node, "from");
+    const char *type = wa_node_get_attr(node, "type");
+    const char *participant = wa_node_get_attr(node, "participant");
+    const char *recipient = wa_node_get_attr(node, "recipient");
+    wa_node_t *ack;
+    if (!id || !from)
+        return;
+    ack = wa_node_new("ack");
+    if (!ack)
+        return;
+    if (wa_node_add_attr(ack, "id", id) || wa_node_add_attr(ack, "to", from) ||
+        wa_node_add_attr(ack, "class", node->tag) ||
+        (participant && wa_node_add_attr(ack, "participant", participant)) ||
+        (recipient && wa_node_add_attr(ack, "recipient", recipient)) ||
+        (type && strcmp(node->tag, "message") &&
+         wa_node_add_attr(ack, "type", type))) {
+        wa_node_free(ack);
+        return;
+    }
+    send_node_now(r, ack);
+}
+
 static void send_node_now(run_t *r, wa_node_t *node) {
     wa_buf_t b;
     if (!node)
@@ -1191,19 +1227,6 @@ static void send_node_now(run_t *r, wa_node_t *node) {
         wa_buf_free(&b);
     }
     wa_node_free(node);
-}
-
-/* Ack an inbound stanza so the server stops retrying it. */
-static void send_ack(run_t *r, const char *id, const char *from) {
-    wa_node_t *ack = wa_node_new("ack");
-    if (!ack)
-        return;
-    if (wa_node_add_attr(ack, "id", id) || wa_node_add_attr(ack, "to", from) ||
-        wa_node_add_attr(ack, "class", "message")) {
-        wa_node_free(ack);
-        return;
-    }
-    send_node_now(r, ack);
 }
 
 /* Send a delivery/read receipt for an inbound message. Fire-and-forget so it
@@ -1336,7 +1359,7 @@ static const char HELP_TEXT[] =
     "*delete 3* \xe2\x80\x94 remove reminder #3";
 
 static void queue_reply(run_t *r, const char *to, const char *text) {
-    if (r->n_replies >= 4) {
+    if (r->n_replies >= WA_REPLY_SLOTS) {
         rlog(r, "reply queue full, dropping reply to %s", to);
         return;
     }
@@ -1350,7 +1373,7 @@ static int do_send_text(run_t *r, const char *to_raw, const char *text);
 
 static void flush_replies(run_t *r) {
     while (r->n_replies > 0 && r->outcome < 0) {
-        char to[160], text[1400];
+        char to[160], text[WA_REPLY_MAX];
         snprintf(to, sizeof(to), "%s", r->replies[0].to);
         snprintf(text, sizeof(text), "%s", r->replies[0].text);
         /* pop first: sending may dispatch frames that queue more replies */
@@ -1367,7 +1390,7 @@ static void flush_replies(run_t *r) {
 static void handle_command(run_t *r, const char *from, int owner,
                            const char *text) {
     const char *body = text, *arg;
-    char reply[1400], cmd[24], to[WA_SEND_JID_MAX];
+    char reply[WA_REPLY_MAX], cmd[24], to[WA_SEND_JID_MAX];
     size_t k = 0;
     time_t now = time(NULL);
 
@@ -1431,15 +1454,27 @@ static void handle_command(run_t *r, const char *from, int owner,
         } else {
             off += (size_t)snprintf(reply, sizeof(reply),
                                     "\xe2\x8f\xb0 %d reminder(s):", n);
-            for (int i = 0; i < n && off + 160 < sizeof(reply); i++) {
-                char when[160];
+            for (int i = 0; i < n; i++) {
+                char when[160], line[WA_REM_TEXT_MAX + 200];
+                size_t len;
                 wa_rem_describe(&rems[i], now, when, sizeof(when));
-                off += (size_t)snprintf(reply + off, sizeof(reply) - off,
-                                        "\n*#%d* %s \xe2\x80\x94 %.60s",
-                                        rems[i].id, when, rems[i].text);
+                len = (size_t)snprintf(line, sizeof(line),
+                                       "\n*#%d* %s \xe2\x80\x94 %s", rems[i].id,
+                                       when, rems[i].text);
+                if (off + len >= sizeof(reply)) {
+                    /* Split long lists; keep one slot for the last part. */
+                    if (r->n_replies + 2 >= WA_REPLY_SLOTS) {
+                        snprintf(reply + off, sizeof(reply) - off,
+                                 "\n...and %d more", n - i);
+                        break;
+                    }
+                    queue_reply(r, to, reply);
+                    off = 0;
+                    reply[0] = '\0';
+                }
+                memcpy(reply + off, line, len + 1);
+                off += len;
             }
-            if (off + 160 >= sizeof(reply))
-                snprintf(reply + off, sizeof(reply) - off, "\n...");
         }
         free(rems);
         queue_reply(r, to, reply);
@@ -1508,7 +1543,8 @@ static int bump_retry(run_t *r, const char *id) {
 
 /* Ask the sender to re-encrypt with a fresh session (<receipt type=retry>).
  * This also acks the stanza, so the server stops replaying it. */
-static void send_retry_receipt(run_t *r, const char *id, const char *from,
+static void send_retry_receipt(run_t *r, wa_node_t *node, const char *id,
+                               const char *from,
                                const char *participant) {
     wa_node_t *rcpt, *retry;
     char cbuf[16], tbuf[32];
@@ -1518,7 +1554,7 @@ static void send_retry_receipt(run_t *r, const char *id, const char *from,
     count = bump_retry(r, id);
     if (count < 0) {
         rlog(r, "retry: giving up on %s from %s", id, from);
-        send_ack(r, id, from);
+        send_ack(r, node);
         return;
     }
     rcpt = wa_node_new("receipt");
@@ -1600,11 +1636,11 @@ static int handle_message(run_t *r, wa_node_t *node) {
         }
     }
     if (retry && id && strcmp(from, "status@broadcast")) {
-        send_retry_receipt(r, id, from, participant);
+        send_retry_receipt(r, node, id, from, participant);
         return 0;
     }
     if (id)
-        send_ack(r, id, from);
+        send_ack(r, node);
     return 0;
 }
 
@@ -1650,11 +1686,13 @@ static void mark_reminder_fired(int id, long long minute) {
 
 static void daemon_poll(run_t *r) {
     time_t now = time(NULL);
-    wa_reminder_t rems[WA_REM_MAX];
+    /* Heap, not stack: the array is large and stack probing would keep all
+     * of it resident for the life of the process. */
+    wa_reminder_t *rems = malloc(sizeof(*rems) * WA_REM_MAX);
     int n, i;
-    n = wa_rem_load(r->opts->auth_dir, rems, WA_REM_MAX);
-    if (n < 0)
+    if (!rems)
         return;
+    n = wa_rem_load(r->opts->auth_dir, rems, WA_REM_MAX);
     for (i = 0; i < n; i++) {
         for (int back = 0; back < 2; back++) {
             time_t when = now - back * 60;
@@ -1676,10 +1714,13 @@ static void daemon_poll(run_t *r) {
                 rlog(r, "reminder failed id=%d (will retry next check)",
                      rems[i].id);
             }
-            if (r->outcome >= 0)
+            if (r->outcome >= 0) {
+                free(rems);
                 return;
+            }
         }
     }
+    free(rems);
 }
 
 /* Build + upload fresh one-time prekeys, then announce presence.
