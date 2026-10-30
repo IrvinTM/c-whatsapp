@@ -11,6 +11,7 @@
 #include "wa_ws.h"
 
 #include <stdarg.h>
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,6 +64,7 @@ typedef struct {
     long long qr_deadline_ms; /* -1 = none */
     int qr_interval_ms;
     long long keepalive_ms;
+    long long last_rx_ms; /* last decoded frame, for dead-link detection */
     long long end_ms;
     int outcome; /* -1 = keep running, else WA_RUN_* decision */
     int logged_in; /* success seen, post-login queries pending */
@@ -75,14 +77,44 @@ typedef struct {
     int daemon_on;
     int listen_on;
     long long rem_check_ms;
-    long long fired_minute; /* YYYYMMDDHHMM key, -1 = none */
-    int fired_ids[WA_REM_MAX];
-    int n_fired;
     char retry_ids[RETRY_SLOTS][64];
     int retry_counts[RETRY_SLOTS];
     int retry_next;
     wa_sig_t *sig; /* E2EE session + prekey store (heap) */
+    /* chat-command allowlist: phone numbers plus their resolved LID users */
+    char allow_users[16][64];
+    int allow_owner[16]; /* index of the phone number each id belongs to */
+    int n_allow;
+    int n_allow_pn; /* first n entries are phone numbers from opts->allow */
+    /* Chat replies are queued from the frame callback and sent from the
+     * main loop with the full send path (all devices, any session state). */
+    struct {
+        char to[160];
+        char text[1400];
+    } replies[4];
+    int n_replies;
 } run_t;
+
+/* Reminder firings outlive a single connection so a reconnect inside the
+ * same minute (or the one-minute grace window) never sends twice. */
+static int fired_ids[WA_REM_MAX];
+static long long fired_minutes[WA_REM_MAX]; /* UTC minute of each firing */
+static int n_fired;
+
+/* wa_ws_recv that first hands back frames already buffered in the Noise
+ * layer. A feed callback that stops early (query reply, ack) leaves later
+ * frames there; waiting on the socket instead would strand them, e.g. an
+ * unanswered server ping, after which WhatsApp goes silent. Returns BIN with
+ * an empty payload so the caller's wa_noise_feed drains the buffer. */
+static wa_ws_msg_t recv_ws(run_t *r, uint8_t **msg, size_t *len,
+                           int timeout_ms) {
+    if (wa_noise_pending(&r->noise)) {
+        *msg = NULL;
+        *len = 0;
+        return WA_WS_BIN;
+    }
+    return wa_ws_recv(&r->ws, msg, len, timeout_ms);
+}
 
 static long long now_ms(void) {
     struct timespec ts;
@@ -231,7 +263,24 @@ static int on_iq(run_t *r, wa_node_t *node) {
     const char *id = wa_node_get_attr(node, "id");
     wa_node_t *pd = wa_node_get_child(node, "pair-device");
     wa_node_t *ps = wa_node_get_child(node, "pair-success");
+    const char *type = wa_node_get_attr(node, "type");
+    const char *xmlns = wa_node_get_attr(node, "xmlns");
 
+    if (id && type && xmlns && !strcmp(type, "get") &&
+        !strcmp(xmlns, "urn:xmpp:ping")) {
+        /* Server keepalive: an unanswered ping makes WhatsApp stop routing
+         * to this session while leaving the socket open. */
+        wa_node_t *pong = wa_node_new("iq");
+        const char *from = wa_node_get_attr(node, "from");
+        if (pong && !(wa_node_add_attr(pong, "to",
+                                       from ? from : "s.whatsapp.net") ||
+                      wa_node_add_attr(pong, "id", id) ||
+                      wa_node_add_attr(pong, "type", "result")))
+            send_node_now(r, pong);
+        else
+            wa_node_free(pong);
+        return 0;
+    }
     if (pd) {
         /* ack first (Baileys replies before emitting QRs) */
         wa_buf_t b;
@@ -310,6 +359,22 @@ static int on_node(run_t *r, wa_node_t *node) {
         return on_iq(r, node);
     if (!strcmp(node->tag, "message"))
         return handle_message(r, node);
+    if (!strcmp(node->tag, "ib")) {
+        /* The server hands us edge-routing bytes after login. Persist them
+         * so the next WSS connect can resume the stream with ?ED=. */
+        wa_node_t *er = wa_node_get_child(node, "edge_routing");
+        wa_node_t *ri = er ? wa_node_get_child(er, "routing_info") : NULL;
+        if (ri && ri->ctype == WA_CONTENT_BYTES && ri->content.bytes.len &&
+            ri->content.bytes.len <= WA_ROUTE_MAX) {
+            memcpy(r->creds->routing_info, ri->content.bytes.data,
+                   ri->content.bytes.len);
+            r->creds->routing_info_len = ri->content.bytes.len;
+            save_creds(r);
+            rlog(r, "saved edge routing info (%zu bytes)",
+                 ri->content.bytes.len);
+        }
+        return 0;
+    }
     if (!strcmp(node->tag, "success")) {
         const char *lid = wa_node_get_attr(node, "lid");
         rlog(r, "login success%s%s", lid ? " lid=" : "", lid ? lid : "");
@@ -331,6 +396,9 @@ static int on_node(run_t *r, wa_node_t *node) {
     }
     if (!strcmp(node->tag, "stream:error") ||
         !strcmp(node->tag, "xmlstreamend")) {
+        char *d = wa_node_to_string(node);
+        rlog(r, "stream closed by server: %.400s", d ? d : node->tag);
+        free(d);
         if (r->opts->on_close)
             r->opts->on_close(node->tag, r->opts->user);
         r->outcome = WA_RUN_ERROR;
@@ -346,11 +414,17 @@ static int frame_cb(const uint8_t *frame, size_t len, void *user) {
     int rc;
     if (wa_decode_node(frame, len, &node, &consumed))
         return 0; /* ignore undecodable frames */
+    r->last_rx_ms = now_ms();
     {
         const char *id = wa_node_get_attr(node, "id");
         const char *type = wa_node_get_attr(node, "type");
         rlog(r, "recv %s%s%s%s%s", node->tag, id ? " id=" : "", id ? id : "",
              type ? " type=" : "", type ? type : "");
+        if (!strcmp(node->tag, "receipt"))
+            rlog(r, "message receipt type=%s id=%s from=%s",
+                 type ? type : "?", id ? id : "?",
+                 wa_node_get_attr(node, "from") ? wa_node_get_attr(node, "from")
+                                                : "?");
         if (!strcmp(node->tag, "receipt") || !strcmp(node->tag, "ack") ||
             !strcmp(node->tag, "message") || !strcmp(node->tag, "notification") ||
             !strcmp(node->tag, "ib")) {
@@ -426,7 +500,7 @@ static wa_node_t *run_query(run_t *r, wa_node_t *node, int timeout_ms) {
         int slice = left > 5000 ? 5000 : (int)left;
         if (slice < 0)
             slice = 0;
-        m = wa_ws_recv(&r->ws, &msg, &msglen, slice);
+        m = recv_ws(r, &msg, &msglen, slice);
         if (m == WA_WS_TIMEOUT) {
             free(msg);
             continue;
@@ -536,223 +610,6 @@ static void gen_msg_id(char out[32]) {
     out[22] = '\0';
 }
 
-/* WAMessage{conversation} + random pad 1..16 (Baileys writeRandomPadMax16). */
-static int encode_plaintext(const char *text, uint8_t **out, size_t *outlen) {
-    wa_pbw_t w;
-    uint8_t padn;
-    uint8_t pr[1];
-    if (!text || !out || !outlen)
-        return -1;
-    if (wa_pb_encode_wamessage_text(text, &w))
-        return -1;
-    if (RAND_bytes(pr, 1) != 1) {
-        wa_pbw_free(&w);
-        return -1;
-    }
-    padn = (uint8_t)((pr[0] & 0x0F) + 1);
-    uint8_t *buf = malloc(w.len + padn);
-    if (!buf) {
-        wa_pbw_free(&w);
-        return -1;
-    }
-    memcpy(buf, w.data, w.len);
-    memset(buf + w.len, padn, padn);
-    *out = buf;
-    *outlen = w.len + padn;
-    wa_pbw_free(&w);
-    return 0;
-}
-
-static int cmp_str(const void *a, const void *b) {
-    return strcmp((const char *)a, (const char *)b);
-}
-
-/* phash = "2:" + b64(sha256(sorted-concat))[:6] (kept for debugging;
- * not sent on the stanza in current Baileys). */
-static void __attribute__((unused))
-make_phash(char (*jids)[WA_SEND_JID_MAX], size_t n, char out[16]) {
-    uint8_t h[32];
-    char b64[64];
-    size_t total = 0;
-    uint8_t *cat;
-    qsort(jids, n, WA_SEND_JID_MAX, cmp_str);
-    for (size_t i = 0; i < n; i++)
-        total += strlen(jids[i]);
-    cat = malloc(total ? total : 1);
-    if (!cat) {
-        out[0] = '\0';
-        return;
-    }
-    total = 0;
-    for (size_t i = 0; i < n; i++) {
-        size_t l = strlen(jids[i]);
-        memcpy(cat + total, jids[i], l);
-        total += l;
-    }
-    wa_sha256(cat, total, h);
-    free(cat);
-    wa_b64_encode(h, 32, b64, sizeof(b64));
-    snprintf(out, 16, "2:%.6s", b64);
-}
-
-/* X3DH + first Double-Ratchet step, pkmsg only (fresh session per device).
- * Mirrors libsignal session_builder.initSession(initiator) +
- * session_cipher.encrypt first message. */
-static int x3dh_encrypt_pkmsg(const wa_creds_t *creds, const wa_dev_bundle_t *b,
-                             const uint8_t *pt, size_t ptlen,
-                             uint8_t **out, size_t *outlen) {
-    uint8_t base_priv[32], base_pub[32], base33[33];
-    uint8_t eph_priv[32], eph_pub[32], eph33[33];
-    uint8_t our_id33[33], their_id33[33];
-    uint8_t a1[32], a2[32], a3[32], a4[32];
-    uint8_t *shared = NULL;
-    size_t shared_len;
-    uint8_t zeros[32];
-    uint8_t master[96], master2[96];
-    uint8_t chain_key[32], msg_key_raw[32], next_chain[32];
-    uint8_t enc_key[32], mac_key[32], iv32[32];
-    uint8_t *ct = NULL;
-    wa_pbw_t wmsg, pre;
-    uint8_t *msgbuf = NULL;
-    size_t msgbuf_len;
-    uint8_t *mac_input = NULL;
-    uint8_t mac[32];
-    uint8_t *inner = NULL;
-    uint8_t *body = NULL;
-    int rc = -1;
-
-    memset(zeros, 0, 32);
-    if (RAND_bytes(base_priv, 32) != 1 || RAND_bytes(eph_priv, 32) != 1)
-        return -1;
-    if (wa_x25519_pub(base_pub, base_priv) ||
-        wa_x25519_pub(eph_pub, eph_priv))
-        return -1;
-    base33[0] = 5;
-    memcpy(base33 + 1, base_pub, 32);
-    eph33[0] = 5;
-    memcpy(eph33 + 1, eph_pub, 32);
-    our_id33[0] = 5;
-    memcpy(our_id33 + 1, creds->ident_pub, 32);
-    their_id33[0] = 5;
-    memcpy(their_id33 + 1, b->identity, 32);
-
-    if (wa_x25519_shared(a1, creds->ident_priv, b->spk) ||
-        wa_x25519_shared(a2, base_priv, b->identity) ||
-        wa_x25519_shared(a3, base_priv, b->spk))
-        return -1;
-    if (b->have_opk && wa_x25519_shared(a4, base_priv, b->opk))
-        return -1;
-    shared_len = b->have_opk ? 32 * 5 : 32 * 4;
-    shared = malloc(shared_len);
-    if (!shared)
-        return -1;
-    memset(shared, 0xFF, 32);
-    memcpy(shared + 32, a1, 32);
-    memcpy(shared + 64, a2, 32);
-    memcpy(shared + 96, a3, 32);
-    if (b->have_opk)
-        memcpy(shared + 128, a4, 32);
-    if (wa_hkdf_sha256(master, sizeof(master), shared, shared_len, zeros, 32,
-                       (const uint8_t *)"WhisperText", 11)) {
-        free(shared);
-        return -1;
-    }
-    free(shared);
-
-    /* sending ratchet with their signed prekey */
-    {
-        uint8_t ss[32];
-        if (wa_x25519_shared(ss, eph_priv, b->spk))
-            return -1;
-        if (wa_hkdf_sha256(master2, sizeof(master2), ss, 32, master, 32,
-                           (const uint8_t *)"WhisperRatchet", 14))
-            return -1;
-    }
-    memcpy(chain_key, master2 + 32, 32);
-    /* fillMessageKeys(0): msg = HMAC(chain,0x01), next = HMAC(chain,0x02) */
-    {
-        uint8_t one = 1, two = 2;
-        if (wa_hmac_sha256(chain_key, 32, &one, 1, msg_key_raw) ||
-            wa_hmac_sha256(chain_key, 32, &two, 1, next_chain))
-            return -1;
-    }
-    (void)next_chain;
-    if (wa_hkdf_sha256(master2, sizeof(master2), msg_key_raw, 32, zeros, 32,
-                       (const uint8_t *)"WhisperMessageKeys", 18))
-        return -1;
-    memcpy(enc_key, master2, 32);
-    memcpy(mac_key, master2 + 32, 32);
-    memcpy(iv32, master2 + 64, 32);
-
-    ct = malloc(ptlen + 16);
-    if (!ct)
-        return -1;
-    {
-        int cl = wa_aes_cbc_encrypt(pt, ptlen, enc_key, iv32, ct, ptlen + 16);
-        if (cl <= 0) {
-            free(ct);
-            return -1;
-        }
-        if (wa_pb_encode_whisper(eph33, 0, 0, ct, (size_t)cl, &wmsg)) {
-            free(ct);
-            return -1;
-        }
-        free(ct);
-    }
-    msgbuf_len = wmsg.len;
-    msgbuf = malloc(msgbuf_len);
-    if (!msgbuf) {
-        wa_pbw_free(&wmsg);
-        return -1;
-    }
-    memcpy(msgbuf, wmsg.data, msgbuf_len);
-    wa_pbw_free(&wmsg);
-
-    mac_input = malloc(33 + 33 + 1 + msgbuf_len);
-    if (!mac_input) {
-        free(msgbuf);
-        return -1;
-    }
-    memcpy(mac_input, our_id33, 33);
-    memcpy(mac_input + 33, their_id33, 33);
-    mac_input[66] = 0x33;
-    memcpy(mac_input + 67, msgbuf, msgbuf_len);
-    if (wa_hmac_sha256(mac_key, 32, mac_input, 67 + msgbuf_len, mac)) {
-        free(mac_input);
-        free(msgbuf);
-        return -1;
-    }
-    free(mac_input);
-    inner = malloc(1 + msgbuf_len + 8);
-    if (!inner) {
-        free(msgbuf);
-        return -1;
-    }
-    inner[0] = 0x33;
-    memcpy(inner + 1, msgbuf, msgbuf_len);
-    memcpy(inner + 1 + msgbuf_len, mac, 8);
-    free(msgbuf);
-
-    if (wa_pb_encode_prekey_msg(our_id33, base33, creds->registration_id,
-                                b->spk_id, b->have_opk, b->opk_id, inner,
-                                1 + msgbuf_len + 8, &pre)) {
-        free(inner);
-        return -1;
-    }
-    free(inner);
-    body = malloc(1 + pre.len);
-    if (!body) {
-        wa_pbw_free(&pre);
-        return -1;
-    }
-    body[0] = 0x33;
-    memcpy(body + 1, pre.data, pre.len);
-    *out = body;
-    *outlen = 1 + pre.len;
-    wa_pbw_free(&pre);
-    rc = 0;
-    return rc;
-}
 
 /* usync device discovery for one bare JID. Fills jids[] with full device
  * JIDs (LID preferred when the server returns a lid mapping). */
@@ -1041,7 +898,7 @@ static int wait_ack(run_t *r, const char *msg_id, int timeout_ms) {
         wa_ws_msg_t m;
         if (slice < 0)
             slice = 0;
-        m = wa_ws_recv(&r->ws, &msg, &msglen, slice);
+        m = recv_ws(r, &msg, &msglen, slice);
         if (m == WA_WS_TIMEOUT) {
             free(msg);
             continue;
@@ -1074,6 +931,7 @@ static int do_send_text(run_t *r, const char *to_raw, const char *text) {
     char targets[WA_SEND_MAX_DEVICES][WA_SEND_JID_MAX];
     size_t nt = 0;
     wa_node_t *msg = NULL, *parts = NULL, *di = NULL;
+    int used_pkmsg = 0;
     int rc = -1;
 
     if (normalize_jid(to_raw, dest_bare)) {
@@ -1081,9 +939,23 @@ static int do_send_text(run_t *r, const char *to_raw, const char *text) {
         return -1;
     }
     gen_msg_id(msg_id);
-    if (encode_plaintext(text, &pt, &ptlen)) {
-        rlog(r, "send: plaintext encode failed");
-        return -1;
+    {
+        /* The Signal layer adds Baileys writeRandomPadMax16 itself, so pass
+         * the bare WAMessage here. */
+        wa_pbw_t w;
+        if (wa_pb_encode_wamessage_text(text, &w)) {
+            rlog(r, "send: plaintext encode failed");
+            return -1;
+        }
+        pt = malloc(w.len);
+        if (!pt) {
+            wa_pbw_free(&w);
+            rlog(r, "send: out of memory");
+            return -1;
+        }
+        memcpy(pt, w.data, w.len);
+        ptlen = w.len;
+        wa_pbw_free(&w);
     }
     if (fetch_devices(r, dest_bare, devices, &ndev)) {
         rlog(r, "send: device discovery failed");
@@ -1149,11 +1021,40 @@ static int do_send_text(run_t *r, const char *to_raw, const char *text) {
     for (size_t i = 0; i < nb; i++) {
         uint8_t *body = NULL;
         size_t bodylen = 0;
+        const char *etype = "pkmsg";
         wa_node_t *to = NULL, *enc = NULL;
-        if (x3dh_encrypt_pkmsg(r->creds, &bundles[i], pt, ptlen, &body,
-                               &bodylen)) {
-            rlog(r, "send: encrypt failed for %s", bundles[i].jid);
-            continue;
+        int have_session =
+            r->sig && wa_sig_session_confirmed(r->sig, bundles[i].jid);
+        if (have_session) {
+            /* Reuse the established Double Ratchet instead of replacing it
+             * with a fresh X3DH session on every send. */
+            if (wa_sig_encrypt(r->sig, bundles[i].jid, pt, ptlen, &body,
+                               &bodylen) == 0) {
+                etype = "msg";
+            } else {
+                rlog(r, "send: session for %s unusable, re-establishing",
+                     bundles[i].jid);
+                have_session = 0;
+            }
+        }
+        if (!have_session) {
+            wa_bundle_t b;
+            memset(&b, 0, sizeof(b));
+            memcpy(b.identity, bundles[i].identity, 32);
+            memcpy(b.spk, bundles[i].spk, 32);
+            b.spk_id = bundles[i].spk_id;
+            memcpy(b.spk_sig, bundles[i].spk_sig, 64);
+            memcpy(b.opk, bundles[i].opk, 32);
+            b.opk_id = bundles[i].opk_id;
+            b.have_opk = bundles[i].have_opk;
+            b.reg_id = bundles[i].reg_id;
+            if (wa_sig_encrypt_pkmsg(r->sig, bundles[i].jid, &b, pt, ptlen,
+                                     &body, &bodylen)) {
+                rlog(r, "send: encrypt failed for %s", bundles[i].jid);
+                continue;
+            }
+            etype = "pkmsg";
+            used_pkmsg = 1;
         }
         to = wa_node_new("to");
         enc = wa_node_new("enc");
@@ -1165,7 +1066,7 @@ static int do_send_text(run_t *r, const char *to_raw, const char *text) {
         }
         if (wa_node_add_attr(to, "jid", bundles[i].jid) ||
             wa_node_add_attr(enc, "v", "2") ||
-            wa_node_add_attr(enc, "type", "pkmsg") ||
+            wa_node_add_attr(enc, "type", etype) ||
             wa_node_set_bytes(enc, body, bodylen) ||
             wa_node_add_child(to, enc) || wa_node_add_child(parts, to)) {
             wa_node_free(to);
@@ -1186,8 +1087,9 @@ static int do_send_text(run_t *r, const char *to_raw, const char *text) {
     if (wa_node_add_child(msg, parts))
         goto fail;
     parts = NULL;
-    /* device-identity (all first-messages are pkmsg -> include) */
-    if (r->creds->account.present) {
+    /* device-identity is only needed when at least one pkmsg opens a new
+     * session; pure ratchet messages don't carry it. */
+    if (r->creds->account.present && used_pkmsg) {
         wa_pbw_t acc;
         di = wa_node_new("device-identity");
         if (!di)
@@ -1235,8 +1137,11 @@ static int do_send_text(run_t *r, const char *to_raw, const char *text) {
     }
     /* stay online briefly to catch delivery/retry receipts */
     {
-        long long end = now_ms() + 15000;
-        rlog(r, "send: listening 15s for receipts/retries...");
+        int wait_ms = r->opts->receipt_wait_ms > 0
+                          ? r->opts->receipt_wait_ms
+                          : 15000;
+        long long end = now_ms() + wait_ms;
+        rlog(r, "send: listening %dms for receipts/retries...", wait_ms);
         while (now_ms() < end) {
             uint8_t *m = NULL;
             size_t ml = 0;
@@ -1245,7 +1150,7 @@ static int do_send_text(run_t *r, const char *to_raw, const char *text) {
             wa_ws_msg_t w;
             if (slice < 0)
                 slice = 0;
-            w = wa_ws_recv(&r->ws, &m, &ml, slice);
+            w = recv_ws(r, &m, &ml, slice);
             if (w == WA_WS_TIMEOUT) {
                 free(m);
                 continue;
@@ -1253,24 +1158,6 @@ static int do_send_text(run_t *r, const char *to_raw, const char *text) {
             if (w != WA_WS_BIN) {
                 free(m);
                 break;
-            }
-            /* log raw decoded node for diagnosis */
-            {
-                wa_node_t *nn = NULL;
-                size_t cc = 0;
-                if (!wa_decode_node(m, ml, &nn, &cc)) {
-                    /* feed through normal path to keep noise state */
-                    char *d = wa_node_to_string(nn);
-                    /* note: feeding again below will decode twice, but
-                     * wa_noise_feed handles decrypt; we just peeked at
-                     * raw transport bytes? Actually m is still encrypted
-                     * frame, wa_decode_node on encrypted bytes fails.
-                     * So just free and feed normally. */
-                    if (d) {
-                        free(d);
-                    }
-                    wa_node_free(nn);
-                }
             }
             if (wa_noise_feed(&r->noise, m, ml, frame_cb, r) < 0) {
                 free(m);
@@ -1319,63 +1206,199 @@ static void send_ack(run_t *r, const char *id, const char *from) {
     send_node_now(r, ack);
 }
 
-/* Reply on an existing session (produces a "msg" body). Fire-and-forget so it
+/* Send a delivery/read receipt for an inbound message. Fire-and-forget so it
  * is safe to call from the receive path. */
-static int send_session_text(run_t *r, const char *addr, const char *text) {
-    wa_pbw_t w;
-    char msg_id[32];
-    uint8_t *body = NULL;
-    size_t blen = 0;
-    wa_node_t *msg = NULL, *enc = NULL;
-    if (!r->sig || !text)
-        return -1;
-    if (wa_pb_encode_wamessage_text(text, &w))
-        return -1;
-    if (wa_sig_encrypt(r->sig, addr, w.data, w.len, &body, &blen)) {
-        wa_pbw_free(&w);
-        rlog(r, "reply: no session for %s", addr);
-        return -1;
+static void send_receipt(run_t *r, const char *id, const char *from,
+                         const char *participant, const char *type) {
+    wa_node_t *rcpt;
+    char tbuf[32];
+    if (!id || !from || !type)
+        return;
+    rcpt = wa_node_new("receipt");
+    if (!rcpt)
+        return;
+    if (wa_node_add_attr(rcpt, "id", id) ||
+        wa_node_add_attr(rcpt, "to", from) ||
+        wa_node_add_attr(rcpt, "type", type) ||
+        (participant && wa_node_add_attr(rcpt, "participant", participant))) {
+        wa_node_free(rcpt);
+        return;
     }
-    wa_pbw_free(&w);
-    gen_msg_id(msg_id);
-    msg = wa_node_new("message");
-    enc = wa_node_new("enc");
-    if (!msg || !enc) {
-        free(body);
-        wa_node_free(msg);
-        wa_node_free(enc);
-        return -1;
+    if (!strcmp(type, "read")) {
+        snprintf(tbuf, sizeof(tbuf), "%lld", (long long)time(NULL));
+        if (wa_node_add_attr(rcpt, "t", tbuf)) {
+            wa_node_free(rcpt);
+            return;
+        }
     }
-    if (wa_node_add_attr(msg, "id", msg_id) ||
-        wa_node_add_attr(msg, "to", addr) ||
-        wa_node_add_attr(msg, "type", "text") ||
-        wa_node_add_attr(enc, "v", "2") ||
-        wa_node_add_attr(enc, "type", "msg") ||
-        wa_node_set_bytes(enc, body, blen) || wa_node_add_child(msg, enc)) {
-        free(body);
-        wa_node_free(msg);
-        return -1;
-    }
-    free(body);
-    send_node_now(r, msg);
-    rlog(r, "reply sent to %s (id %s): %s", addr, msg_id, text);
-    return 0;
+    send_node_now(r, rcpt);
 }
 
-/* Handle /reminder-style commands received over WhatsApp. */
-static void handle_command(run_t *r, const char *from, const char *text) {
-    const char *body = text;
-    char reply[1024];
+/* "123:4@lid" / "123@s.whatsapp.net" -> "123". */
+static void jid_user(const char *jid, char out[64]) {
+    size_t n = 0;
+    if (jid && *jid == '+')
+        jid++;
+    while (jid && jid[n] && jid[n] != ':' && jid[n] != '@' && n < 63)
+        n++;
+    memcpy(out, jid ? jid : "", n);
+    out[n] = '\0';
+}
+
+static void allow_add(run_t *r, const char *user, int owner) {
+    if (!user[0] || r->n_allow >= 16)
+        return;
+    for (int i = 0; i < r->n_allow; i++)
+        if (!strcmp(r->allow_users[i], user))
+            return;
+    r->allow_owner[r->n_allow] = owner < 0 ? r->n_allow : owner;
+    snprintf(r->allow_users[r->n_allow++], 64, "%s", user);
+}
+
+/* Parse opts->allow ("+1555..., 1666...") into digit-only numbers. */
+static void allow_init(run_t *r) {
+    const char *p = r->opts->allow;
+    r->n_allow = 0;
+    while (p && *p) {
+        char num[64];
+        size_t n = 0;
+        while (*p && *p != ',' && *p != ' ' && *p != ';') {
+            if (*p >= '0' && *p <= '9' && n < 63)
+                num[n++] = *p;
+            p++;
+        }
+        num[n] = '\0';
+        if (n >= 7)
+            allow_add(r, num, -1);
+        while (*p == ',' || *p == ' ' || *p == ';')
+            p++;
+    }
+    r->n_allow_pn = r->n_allow;
+}
+
+/* Messages from phones arrive addressed by LID, so look up each allowed
+ * number's LID once we are online. */
+static int fetch_devices(run_t *r, const char *bare_jid,
+                         char out[][WA_SEND_JID_MAX], size_t *out_n);
+static void allow_resolve(run_t *r) {
+    for (int i = 0; i < r->n_allow_pn; i++) {
+        char bare[WA_SEND_JID_MAX], devs[WA_SEND_MAX_DEVICES][WA_SEND_JID_MAX];
+        size_t nd = 0;
+        snprintf(bare, sizeof(bare), "%s@s.whatsapp.net", r->allow_users[i]);
+        if (fetch_devices(r, bare, devs, &nd))
+            continue;
+        for (size_t k = 0; k < nd; k++) {
+            char u[64];
+            if (!strstr(devs[k], "@lid"))
+                continue;
+            jid_user(devs[k], u);
+            allow_add(r, u, i);
+        }
+    }
+    rlog(r, "chat commands allowed for %d number(s) (%d ids)", r->n_allow_pn,
+         r->n_allow);
+}
+
+/* Returns the allowlisted phone number index for a sender, or -1. */
+static int sender_owner(run_t *r, wa_node_t *node, const char *from) {
+    const char *alt[3];
+    alt[0] = from;
+    alt[1] = wa_node_get_attr(node, "sender_pn");
+    alt[2] = wa_node_get_attr(node, "participant_pn");
+    for (int a = 0; a < 3; a++) {
+        char u[64];
+        if (!alt[a])
+            continue;
+        jid_user(alt[a], u);
+        for (int i = 0; i < r->n_allow; i++)
+            if (!strcmp(u, r->allow_users[i]))
+                return r->allow_owner[i];
+    }
+    return -1;
+}
+
+static const char HELP_TEXT[] =
+    "\xe2\x8f\xb0 *Reminders*\n"
+    "Just write what you need, for example:\n"
+    "\xe2\x80\xa2 remind me in 20 minutes to check the oven\n"
+    "\xe2\x80\xa2 remind me tomorrow at 9am to call mom\n"
+    "\xe2\x80\xa2 remind me friday evening to pay rent\n"
+    "\xe2\x80\xa2 remind me nov 3 at 14:30 dentist\n"
+    "\xe2\x80\xa2 remind me every day at 8pm to take pills\n"
+    "\xe2\x80\xa2 remind me every weekday at 7:50 class starts\n"
+    "\xe2\x80\xa2 remind me every mon and wed at 6pm gym\n"
+    "\n"
+    "*list* \xe2\x80\x94 show reminders\n"
+    "*delete 3* \xe2\x80\x94 remove reminder #3\n"
+    "*tz UTC-6* \xe2\x80\x94 set your timezone";
+
+static void queue_reply(run_t *r, const char *to, const char *text) {
+    if (r->n_replies >= 4) {
+        rlog(r, "reply queue full, dropping reply to %s", to);
+        return;
+    }
+    snprintf(r->replies[r->n_replies].to, sizeof(r->replies[0].to), "%s", to);
+    snprintf(r->replies[r->n_replies].text, sizeof(r->replies[0].text), "%s",
+             text);
+    r->n_replies++;
+}
+
+static int do_send_text(run_t *r, const char *to_raw, const char *text);
+
+static void flush_replies(run_t *r) {
+    while (r->n_replies > 0 && r->outcome < 0) {
+        char to[160], text[1400];
+        snprintf(to, sizeof(to), "%s", r->replies[0].to);
+        snprintf(text, sizeof(text), "%s", r->replies[0].text);
+        /* pop first: sending may dispatch frames that queue more replies */
+        memmove(&r->replies[0], &r->replies[1],
+                sizeof(r->replies[0]) * (size_t)(r->n_replies - 1));
+        r->n_replies--;
+        if (do_send_text(r, to, text))
+            rlog(r, "reply to %s failed", to);
+    }
+}
+
+/* Handle reminder commands received over WhatsApp (allowed senders only).
+ * We are inside the frame callback here, so replies are only queued. */
+static void handle_command(run_t *r, const char *from, int owner,
+                           const char *text) {
+    const char *body = text, *arg;
+    char reply[1400], cmd[24], to[WA_SEND_JID_MAX];
+    size_t k = 0;
+    int tz = wa_rem_tz_load(r->opts->auth_dir, r->opts->tz_min);
+    time_t now = time(NULL);
+
     while (*body == ' ' || *body == '\t' || *body == '\n')
         body++;
-    if (!strncmp(body, "/reminder", 9) &&
-        (body[9] == '\0' || body[9] == ' ' || body[9] == '\t')) {
+    arg = body + (*body == '/');
+    while (*arg && !isspace((unsigned char)*arg) && k + 1 < sizeof(cmd))
+        cmd[k++] = (char)tolower((unsigned char)*arg++);
+    cmd[k] = '\0';
+    while (*arg == ' ' || *arg == '\t')
+        arg++;
+    /* Deliver reminders to the sender's phone number (stable, and the
+     * send path resolves it to every device). */
+    if (owner >= 0 && owner < r->n_allow_pn)
+        snprintf(to, sizeof(to), "%s@s.whatsapp.net", r->allow_users[owner]);
+    else if (normalize_jid(from, to))
+        snprintf(to, sizeof(to), "%s", from);
+
+    if (wa_rem_is_request(body)) {
         wa_rem_spec_t spec;
-        if (wa_rem_parse_spec(body, from, wa_rem_local_offset(), &spec) == 0) {
+        char err[256];
+        if (wa_rem_parse_natural(body, now, tz, to, &spec, err, sizeof(err))) {
+            snprintf(reply, sizeof(reply),
+                     "\xf0\x9f\xa4\x94 Sorry, %s\n\nSend *help* for examples.",
+                     err);
+        } else {
             int id = wa_rem_add_spec(r->opts->auth_dir, &spec);
-            if (id >= 0) {
+            if (id < 0) {
+                snprintf(reply, sizeof(reply),
+                         "\xe2\x9a\xa0\xef\xb8\x8f Could not save the reminder.");
+            } else {
                 wa_reminder_t tmp;
-                char sched[128];
+                char when[160];
                 memset(&tmp, 0, sizeof(tmp));
                 tmp.id = id;
                 tmp.days = spec.days;
@@ -1384,57 +1407,80 @@ static void handle_command(run_t *r, const char *from, const char *text) {
                 tmp.tz_min = spec.tz_min;
                 tmp.repeat = spec.repeat;
                 snprintf(tmp.date, sizeof(tmp.date), "%s", spec.date);
-                wa_rem_fmt_schedule(&tmp, sched, sizeof(sched));
+                wa_rem_describe(&tmp, now, when, sizeof(when));
                 snprintf(reply, sizeof(reply),
-                         "reminder #%d saved: %s -> %s: %s", id, sched,
-                         spec.to, spec.text);
-            } else {
-                snprintf(reply, sizeof(reply), "failed to save reminder");
+                         "\xe2\x9c\x85 Reminder #%d set for %s:\n%s", id, when,
+                         spec.text);
             }
-        } else {
-            snprintf(reply, sizeof(reply),
-                     "usage: /reminder [YYYY-MM-DD] HH:MM [UTC-6] "
-                     "[once|daily|weekly|Mon-Fri] [TO] TITLE");
         }
-        send_session_text(r, from, reply);
+        queue_reply(r, to, reply);
         return;
     }
-    if (!strcmp(body, "/reminders") || !strcmp(body, "/list")) {
-        wa_reminder_t rems[WA_REM_MAX];
-        int n = wa_rem_load(r->opts->auth_dir, rems, WA_REM_MAX);
+    if (!strcmp(cmd, "list") || !strcmp(cmd, "reminders") ||
+        !strcmp(cmd, "ls")) {
+        wa_reminder_t *rems = malloc(sizeof(*rems) * WA_REM_MAX);
+        int n = rems ? wa_rem_load(r->opts->auth_dir, rems, WA_REM_MAX) : -1;
         size_t off = 0;
-        reply[0] = '\0';
-        off += (size_t)snprintf(reply + off, sizeof(reply) - off,
-                                "%d reminder(s):", n < 0 ? 0 : n);
-        for (int i = 0; i < n && off + 200 < sizeof(reply); i++) {
-            char sched[128];
-            wa_rem_fmt_schedule(&rems[i], sched, sizeof(sched));
-            off += (size_t)snprintf(reply + off, sizeof(reply) - off,
-                                    "\n#%d %s %s", rems[i].id, sched,
-                                    rems[i].text);
+        if (n <= 0) {
+            snprintf(reply, sizeof(reply),
+                     "No reminders yet. Try: remind me tomorrow at 9am to "
+                     "call mom");
+        } else {
+            off += (size_t)snprintf(reply, sizeof(reply),
+                                    "\xe2\x8f\xb0 %d reminder(s):", n);
+            for (int i = 0; i < n && off + 160 < sizeof(reply); i++) {
+                char when[160];
+                wa_rem_describe(&rems[i], now, when, sizeof(when));
+                off += (size_t)snprintf(reply + off, sizeof(reply) - off,
+                                        "\n*#%d* %s \xe2\x80\x94 %.60s",
+                                        rems[i].id, when, rems[i].text);
+            }
+            if (off + 160 >= sizeof(reply))
+                snprintf(reply + off, sizeof(reply) - off, "\n...");
         }
-        if (!n)
-            snprintf(reply, sizeof(reply), "no reminders");
-        send_session_text(r, from, reply);
+        free(rems);
+        queue_reply(r, to, reply);
         return;
     }
-    if (!strncmp(body, "/del", 4)) {
-        const char *num = !strncmp(body, "/delete", 7) ? body + 7 : body + 4;
-        int id = atoi(num);
-        if (wa_rem_del(r->opts->auth_dir, id) == 0)
-            snprintf(reply, sizeof(reply), "deleted reminder #%d", id);
+    if (!strcmp(cmd, "delete") || !strcmp(cmd, "del") ||
+        !strcmp(cmd, "cancel") || !strcmp(cmd, "remove") ||
+        !strcmp(cmd, "rm")) {
+        int id = atoi(*arg == '#' ? arg + 1 : arg);
+        if (id > 0 && wa_rem_del(r->opts->auth_dir, id) == 0)
+            snprintf(reply, sizeof(reply),
+                     "\xf0\x9f\x97\x91\xef\xb8\x8f Deleted reminder #%d", id);
         else
-            snprintf(reply, sizeof(reply), "no reminder #%d", id);
-        send_session_text(r, from, reply);
+            snprintf(reply, sizeof(reply),
+                     "No reminder #%d. Send *list* to see them.", id);
+        queue_reply(r, to, reply);
         return;
     }
-    if (!strcmp(body, "/help")) {
-        send_session_text(r, from,
-                          "/reminder [YYYY-MM-DD] HH:MM [UTC-6] "
-                          "[once|daily|weekly|Mon-Fri] [TO] TITLE | "
-                          "/reminders | /del N");
+    if (!strcmp(cmd, "tz") || !strcmp(cmd, "timezone")) {
+        int v;
+        if (*arg && wa_rem_tz_parse(arg, &v) == 0) {
+            if (wa_rem_tz_save(r->opts->auth_dir, v) == 0)
+                tz = v;
+            else
+                arg = "";
+        } else if (*arg) {
+            queue_reply(r, to,
+                              "Use an offset like *tz UTC-6* or *tz UTC+5:30*");
+            return;
+        }
+        snprintf(reply, sizeof(reply), "\xf0\x9f\x8c\x8d Timezone %s UTC%c%d:%02d",
+                 *arg ? "set to" : "is", tz < 0 ? '-' : '+', abs(tz) / 60,
+                 abs(tz) % 60);
+        queue_reply(r, to, reply);
         return;
     }
+    if (!strcmp(cmd, "help") || !strcmp(cmd, "start") || !strcmp(cmd, "?") ||
+        !strcmp(cmd, "hi") || !strcmp(cmd, "hello")) {
+        queue_reply(r, to, HELP_TEXT);
+        return;
+    }
+    queue_reply(r, to,
+                      "I only handle reminders \xf0\x9f\x99\x82 "
+                      "Send *help* for examples.");
 }
 
 /* Decrypt an inbound <message>: X3DH/Double-Ratchet, ack, dispatch command. */
@@ -1536,19 +1582,32 @@ static int handle_message(run_t *r, wa_node_t *node) {
             if (wa_sig_decrypt(r->sig, from, etype, body, blen, &pt, &ptlen) ==
                 0) {
                 char text[WA_REM_TEXT_MAX * 2];
+                /* Let the sender see the message as delivered. Status
+                 * broadcasts and our own linked-device sync don't get one. */
+                if (!self && strcmp(from, "status@broadcast"))
+                    send_receipt(r, id, from, participant, "delivery");
                 if (wa_pb_decode_wamessage_text(pt, ptlen, text,
                                                 sizeof(text)) == 0) {
                     rlog(r, "incoming%s from %s: %s", self ? " (self)" : "",
                          from, text);
                     if (r->opts->on_message)
                         r->opts->on_message(from, text, r->opts->user);
-                    if (!self) /* don't act on our own outgoing texts */
-                        handle_command(r, from, text);
+                    /* Never act on our own outgoing texts; only allowlisted
+                     * senders (CWA_ALLOW) may manage reminders. */
+                    int owner = self ? -1 : sender_owner(r, node, from);
+                    if (owner >= 0)
+                        handle_command(r, from, owner, text);
+                    else if (!self)
+                        rlog(r, "ignoring message from %s (not in CWA_ALLOW)",
+                             from);
                 } else {
                     rlog(r, "incoming%s from %s: <non-text>",
                          self ? " (self)" : "", from);
                 }
                 free(pt);
+                if (!self && r->opts->read_receipts &&
+                    strcmp(from, "status@broadcast"))
+                    send_receipt(r, id, from, participant, "read");
             } else {
                 rlog(r, "decrypt failed from %s (%s)", from, etype);
                 retry = 1;
@@ -1564,47 +1623,77 @@ static int handle_message(run_t *r, wa_node_t *node) {
     return 0;
 }
 
-/* Daemon: poll reminders.tsv once per minute, send due via same connection.
- * Dedupe with fired_minute key so each reminder fires once per minute. */
+/* App-level keepalive (Baileys/whatsmeow send this every ~25s). The reply is
+ * an ordinary iq result that on_node ignores; it just refreshes last_rx_ms. */
+static void send_keepalive(run_t *r) {
+    char tag[WA_TAG_MAX];
+    wa_node_t *iq = wa_node_new("iq");
+    wa_node_t *ping = wa_node_new("ping");
+    if (!iq || !ping)
+        goto fail;
+    snprintf(tag, sizeof(tag), "cwa.%lu", r->msg_tag++);
+    if (wa_node_add_attr(iq, "id", tag) ||
+        wa_node_add_attr(iq, "to", "s.whatsapp.net") ||
+        wa_node_add_attr(iq, "type", "get") ||
+        wa_node_add_attr(iq, "xmlns", "w:p") || wa_node_add_child(iq, ping))
+        goto fail;
+    send_node_now(r, iq);
+    return;
+fail:
+    wa_node_free(ping);
+    wa_node_free(iq);
+}
+
+/* Daemon: poll reminders.tsv and send due ones. We check the current and the
+ * previous minute so a slow send cannot make a reminder slip past its slot,
+ * and dedupe on (id, minute) so the grace window never double-fires. */
+static int reminder_fired(int id, long long minute) {
+    for (int k = 0; k < n_fired; k++)
+        if (fired_minutes[k] == minute && fired_ids[k] == id)
+            return 1;
+    return 0;
+}
+
+static void mark_reminder_fired(int id, long long minute) {
+    static int next;
+    fired_ids[next] = id;
+    fired_minutes[next] = minute;
+    next = (next + 1) % WA_REM_MAX;
+    if (n_fired < WA_REM_MAX)
+        n_fired++;
+}
+
 static void daemon_poll(run_t *r) {
     time_t now = time(NULL);
-    long long key;
     wa_reminder_t rems[WA_REM_MAX];
     int n, i;
-    /* UTC minute: reminders may use different UTC offsets. */
-    key = (long long)(now / 60);
-    if (key != r->fired_minute) {
-        r->fired_minute = key;
-        r->n_fired = 0;
-    }
     n = wa_rem_load(r->opts->auth_dir, rems, WA_REM_MAX);
     if (n < 0)
         return;
     for (i = 0; i < n; i++) {
-        int already = 0;
-        for (int k = 0; k < r->n_fired; k++)
-            if (r->fired_ids[k] == rems[i].id) {
-                already = 1;
-                break;
+        for (int back = 0; back < 2; back++) {
+            time_t when = now - back * 60;
+            long long minute = (long long)when / 60;
+            if (!wa_rem_due(&rems[i], when))
+                continue;
+            if (reminder_fired(rems[i].id, minute))
+                continue;
+            rlog(r, "reminder due id=%d to=%s text='%s'", rems[i].id,
+                 rems[i].to, rems[i].text);
+            char msg[WA_REM_TEXT_MAX + 16];
+            snprintf(msg, sizeof(msg), "\xe2\x8f\xb0 %s", rems[i].text);
+            if (do_send_text(r, rems[i].to, msg) == 0) {
+                rlog(r, "reminder sent id=%d", rems[i].id);
+                mark_reminder_fired(rems[i].id, minute);
+                if (rems[i].repeat == WA_REM_ONCE)
+                    wa_rem_del(r->opts->auth_dir, rems[i].id);
+            } else {
+                rlog(r, "reminder failed id=%d (will retry next check)",
+                     rems[i].id);
             }
-        if (already)
-            continue;
-        if (!wa_rem_due(&rems[i], now))
-            continue;
-        rlog(r, "reminder due id=%d to=%s text='%s'", rems[i].id, rems[i].to,
-             rems[i].text);
-        if (do_send_text(r, rems[i].to, rems[i].text) == 0) {
-            rlog(r, "reminder sent id=%d", rems[i].id);
-            if (r->n_fired < WA_REM_MAX)
-                r->fired_ids[r->n_fired++] = rems[i].id;
-            if (rems[i].repeat == WA_REM_ONCE)
-                wa_rem_del(r->opts->auth_dir, rems[i].id);
-        } else {
-            rlog(r, "reminder failed id=%d (will retry next minute)",
-                 rems[i].id);
+            if (r->outcome >= 0)
+                return;
         }
-        if (r->outcome >= 0)
-            return;
     }
 }
 
@@ -1813,6 +1902,7 @@ int wa_conn_run(wa_creds_t *creds, const wa_conn_opts_t *opts) {
         if (pad)
             *pad = '\0';
         snprintf(path, sizeof(path), "%s?ED=%s", WA_WS_PATH, rb64);
+        rlog(&r, "resuming stream with saved edge routing");
     } else {
         snprintf(path, sizeof(path), "%s", WA_WS_PATH);
     }
@@ -2001,6 +2091,7 @@ int wa_conn_run(wa_creds_t *creds, const wa_conn_opts_t *opts) {
         goto out;
     }
     r.keepalive_ms = now_ms() + 25000;
+    r.last_rx_ms = now_ms();
 
     /* pairing-code request (after registration, like Baileys: sent once the
      * socket is ready; pair-device QRs are ignored in this mode). */
@@ -2053,17 +2144,18 @@ int wa_conn_run(wa_creds_t *creds, const wa_conn_opts_t *opts) {
                 }
             }
             if (r.opts->daemon || r.opts->listen) {
+                allow_init(&r);
+                if (r.n_allow)
+                    allow_resolve(&r);
+                else
+                    rlog(&r, "chat commands disabled (set CWA_ALLOW)");
                 if (r.opts->daemon) {
                     r.daemon_on = 1;
                     r.rem_check_ms = 0; /* check immediately */
-                    r.fired_minute = -1;
-                    r.n_fired = 0;
                     rlog(&r, "daemon online, polling reminders...");
                 } else {
                     r.listen_on = 1;
                     r.rem_check_ms = 0; /* reminders also fire while listening */
-                    r.fired_minute = -1;
-                    r.n_fired = 0;
                     rlog(&r, "listening for incoming messages and reminders...");
                 }
                 if (r.opts->on_open)
@@ -2093,8 +2185,21 @@ int wa_conn_run(wa_creds_t *creds, const wa_conn_opts_t *opts) {
             emit_qr(&r);
         }
         if (now >= r.keepalive_ms) {
-            wa_ws_send_ping(&r.ws);
+            /* App-level ping only. WhatsApp's edge answers a WebSocket ping
+             * with a PONG wrapped inside a binary frame; those two bytes land
+             * in the Noise stream, garble the next frame length and the
+             * connection silently stalls. Baileys/whatsmeow never ws-ping. */
+            if (r.logged_in)
+                send_keepalive(&r);
             r.keepalive_ms = now + 25000;
+        }
+        if (r.logged_in && r.post_done && now - r.last_rx_ms > 75000) {
+            /* Our w:p pings get a reply within seconds; three missed
+             * intervals means the stream is dead even if TCP is not. */
+            rlog(&r, "no traffic for %llds, reconnecting",
+                 (now - r.last_rx_ms) / 1000);
+            rc = WA_RUN_ERROR;
+            goto out;
         }
         if ((r.daemon_on || r.listen_on) && now >= r.rem_check_ms) {
             daemon_poll(&r);
@@ -2109,6 +2214,14 @@ int wa_conn_run(wa_creds_t *creds, const wa_conn_opts_t *opts) {
             wait_ms = (int)(r.qr_deadline_ms - now);
         if (r.end_ms)
             wait_ms = wait_ms < (int)(r.end_ms - now) ? wait_ms : (int)(r.end_ms - now);
+        if (r.n_replies) {
+            flush_replies(&r);
+            if (r.outcome >= 0) {
+                rc = r.outcome;
+                goto out;
+            }
+            continue;
+        }
         if (r.daemon_on || r.listen_on)
             wait_ms = wait_ms < (int)(r.rem_check_ms - now)
                           ? wait_ms
@@ -2120,7 +2233,7 @@ int wa_conn_run(wa_creds_t *creds, const wa_conn_opts_t *opts) {
         {
             uint8_t *msg = NULL;
             size_t msglen = 0;
-            wa_ws_msg_t m = wa_ws_recv(&r.ws, &msg, &msglen, wait_ms);
+            wa_ws_msg_t m = recv_ws(&r, &msg, &msglen, wait_ms);
             if (m == WA_WS_TIMEOUT) {
                 free(msg);
                 continue;

@@ -1,0 +1,37 @@
+[Unit]
+Description=c-whatsapp WhatsApp reminder daemon
+Documentation=https://github.com/IrvinTM/c-whatsapp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=c-whatsapp
+Group=c-whatsapp
+StateDirectory=c-whatsapp
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/c-whatsapp
+# CWA_ALLOW=15551234567 (who may manage reminders over chat), CWA_TZ=UTC-6
+EnvironmentFile=-/etc/c-whatsapp/env
+ExecStart=/usr/local/bin/c-whatsapp --auth-dir /var/lib/c-whatsapp --daemon --timeout 0
+Restart=always
+RestartSec=10
+
+# Small-VM guardrails. The process idles at ~3.5 MB private / ~12 MB RSS.
+MemoryMax=64M
+TasksMax=16
+Nice=10
+
+# Hardening: the service only needs its state dir and the network.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/c-whatsapp
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

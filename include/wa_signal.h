@@ -109,6 +109,7 @@ int wa_sig_gen_opks(wa_sig_t *s, uint32_t start_id, int n, uint32_t *ids,
                     uint8_t (*pubs)[32]);
 
 int wa_sig_has_session(const wa_sig_t *s, const char *addr);
+int wa_sig_session_confirmed(const wa_sig_t *s, const char *addr);
 
 /* Decrypt an inbound <enc> body. type = "pkmsg" (PreKeyWhisperMessage) or
  * "msg" (WhisperMessage). On success returns 0 and *out = malloc'd plaintext

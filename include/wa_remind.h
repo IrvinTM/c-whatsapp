@@ -96,6 +96,31 @@ int wa_rem_parse_cmd(const char *body, const char *default_to,
                      char to_out[WA_REM_TO_MAX],
                      char text_out[WA_REM_TEXT_MAX]);
 
+/* True if `text` starts with a reminder trigger ("remind", "/reminder",
+ * "remindme"). */
+int wa_rem_is_request(const char *text);
+
+/* Parse a plain-language request such as
+ *   "remind me tomorrow at 9am to call mom"
+ *   "remind me in 20 minutes to take the pizza out"
+ *   "remind me every weekday at 7:50 class starts"
+ *   "remind me on friday evening to pay rent"
+ *   "remind me nov 3 at 14:30 UTC-6 dentist"
+ * `now` and `tz_min` resolve relative dates; `to` is the recipient.
+ * Returns 0 on success; -1 with a human hint in err otherwise. */
+int wa_rem_parse_natural(const char *text, time_t now, int tz_min,
+                         const char *to, wa_rem_spec_t *out, char *err,
+                         size_t errcap);
+
+/* Friendly schedule, e.g. "tomorrow (Fri 31 Oct) at 09:00 UTC-6" or
+ * "every weekday at 07:50 UTC-6". */
+void wa_rem_describe(const wa_reminder_t *r, time_t now, char *out,
+                     size_t cap);
+
+/* Default timezone for chat requests, stored in <auth_dir>/timezone. */
+int wa_rem_tz_load(const char *auth_dir, int fallback);
+int wa_rem_tz_save(const char *auth_dir, int tz_min);
+
 /* One-line schedule summary: "2026-10-21 07:50 UTC-6 weekly". */
 void wa_rem_fmt_schedule(const wa_reminder_t *r, char *out, size_t cap);
 

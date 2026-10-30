@@ -29,12 +29,14 @@ int main(void) {
     wa_sig_t as, bs, bs2;
     wa_bundle_t bundle;
     uint8_t opk_priv[32], opk_pub[32];
+    uint8_t opk2_priv[32], opk2_pub[32];
     uint8_t *body = NULL, *out = NULL;
     size_t blen = 0, outlen = 0;
     const char *m1 = "hello bob, this is alice";
     const char *m2 = "hi alice, bob here";
     const char *m3 = "second message on the ratchet";
     const char *m4 = "after a restart";
+    const char *m5 = "after the peer reset its session";
 
     if (!dir) {
         perror("mkdtemp");
@@ -49,6 +51,11 @@ int main(void) {
     if (wa_x25519_pub(opk_pub, opk_priv)) {
         memset(opk_priv, 1, 32);
         wa_x25519_pub(opk_pub, opk_priv);
+    }
+    memset(opk2_priv, 2, 32);
+    if (wa_x25519_pub(opk2_pub, opk2_priv)) {
+        ok(0, "opk2 generation");
+        return 1;
     }
 
     wa_sig_init(&as, dir, &alice);
@@ -65,6 +72,20 @@ int main(void) {
     bundle.have_opk = 1;
     bundle.reg_id = bob.registration_id;
 
+    /* A tampered signed-prekey signature must be rejected before X3DH. */
+    {
+        wa_bundle_t bad = bundle;
+        uint8_t *b = NULL;
+        size_t bl = 0;
+        bad.spk_sig[0] ^= 1;
+        ok(wa_sig_encrypt_pkmsg(&as, "bob:1@test", &bad,
+                                (const uint8_t *)m1, strlen(m1), &b, &bl) !=
+               0,
+           "tampered signed-prekey signature rejected");
+        ok(b == NULL, "no body produced for tampered bundle");
+        free(b);
+    }
+
     /* Alice initiator -> Bob responder (pkmsg) */
     if (wa_sig_encrypt_pkmsg(&as, "bob:1@test", &bundle,
                              (const uint8_t *)m1, strlen(m1), &body, &blen)) {
@@ -72,6 +93,8 @@ int main(void) {
         return 1;
     }
     ok(blen > 0 && body[0] == 0x33, "pkmsg body framed");
+    ok(!wa_sig_session_confirmed(&as, "bob:1@test"),
+       "initiator session unconfirmed before reply");
     if (wa_sig_decrypt(&bs, "alice:1@test", "pkmsg", body, blen, &out,
                        &outlen)) {
         ok(0, "bob decrypt pkmsg");
@@ -95,6 +118,8 @@ int main(void) {
         else
             ok(outlen == strlen(m2) && memeq(out, (const uint8_t *)m2, outlen),
                "ratchet reply matches");
+        ok(wa_sig_session_confirmed(&as, "bob:1@test"),
+           "initiator session confirmed after reply");
     }
     free(body);
     free(out);
@@ -132,6 +157,56 @@ int main(void) {
     }
     free(body);
     free(out);
+    body = out = NULL;
+
+    /* Session reset: Alice starts a fresh pkmsg while Bob still has the old
+     * session. Bob must rebuild as responder instead of rejecting the
+     * message. */
+    {
+        wa_sig_add_opk(&bs2, 8, opk2_priv);
+        memcpy(bundle.opk, opk2_pub, 32);
+        bundle.opk_id = 8;
+        if (wa_sig_encrypt_pkmsg(&as, "bob:1@test", &bundle,
+                                 (const uint8_t *)m5, strlen(m5), &body,
+                                 &blen)) {
+            ok(0, "alice encrypt reset pkmsg");
+        } else if (wa_sig_decrypt(&bs2, "alice:1@test", "pkmsg", body, blen,
+                                  &out, &outlen)) {
+            ok(0, "bob decrypt reset pkmsg");
+        } else {
+            ok(outlen == strlen(m5) &&
+                   memeq(out, (const uint8_t *)m5, outlen),
+               "reset pkmsg plaintext matches");
+        }
+    }
+    free(body);
+    free(out);
+    body = out = NULL;
+
+    /* Production padding path: raw WAMessage -> Signal pad -> decrypt ->
+     * WAMessage decode (guards against double random padding). */
+    {
+        wa_pbw_t wm;
+        char got[128];
+        const char *txt = "text through the production padding path";
+        if (wa_pb_encode_wamessage_text(txt, &wm)) {
+            ok(0, "encode wamessage");
+        } else if (wa_sig_encrypt(&as, "bob:1@test", wm.data, wm.len, &body,
+                                  &blen)) {
+            ok(0, "encrypt wamessage msg");
+        } else if (wa_sig_decrypt(&bs2, "alice:1@test", "msg", body, blen, &out,
+                                  &outlen)) {
+            ok(0, "decrypt wamessage msg");
+        } else {
+            ok(wa_pb_decode_wamessage_text(out, outlen, got, sizeof(got)) == 0 &&
+                   !strcmp(got, txt),
+               "wamessage survives signal padding");
+        }
+        wa_pbw_free(&wm);
+    }
+    free(body);
+    free(out);
+    body = out = NULL;
 
     /* WAMessage text extraction */
     {

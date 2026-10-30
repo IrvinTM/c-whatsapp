@@ -478,6 +478,22 @@ int wa_sig_has_session(const wa_sig_t *s, const char *addr) {
     return 0;
 }
 
+/* A session is confirmed once it has a receiving chain: we either answered
+ * their prekey message or decrypted a reply to ours. Until then the peer may
+ * never have seen our pkmsg, so plain "msg" ratchet messages are unsafe. */
+int wa_sig_session_confirmed(const wa_sig_t *s, const char *addr) {
+    for (int i = 0; i < s->n_sessions; i++) {
+        const wa_sig_session_t *ss = &s->sessions[i];
+        if (!ss->used || strcmp(ss->addr, addr))
+            continue;
+        for (int c = 0; c < ss->n_chains; c++)
+            if (!ss->chains[c].is_sending)
+                return ss->have_dhs;
+        return 0;
+    }
+    return 0;
+}
+
 /* ---------------- decrypt ---------------- */
 
 int wa_sig_unpad(const uint8_t *in, size_t inlen, const uint8_t **out,
@@ -658,8 +674,8 @@ int wa_sig_decrypt(wa_sig_t *s, const char *addr, const char *type,
             return -1;
         if (wa_pb_decode_prekey_msg(body + 1, blen - 1, &pk))
             return -1;
+        snprintf(addr_copy, sizeof(addr_copy), "%s", addr);
         if (!ss) {
-            snprintf(addr_copy, sizeof(addr_copy), "%s", addr);
             ss = session_create(s, addr);
             if (!ss)
                 return -1;
@@ -674,6 +690,20 @@ int wa_sig_decrypt(wa_sig_t *s, const char *addr, const char *type,
         memcpy(inner, pk.message, pk.message_len);
         innerlen = pk.message_len;
         rc = decrypt_whisper(s, ss, inner, innerlen, out, outlen);
+        if (rc && !was_new) {
+            /* The peer may have re-established a fresh session. Try this
+             * prekey message as a responder X3DH; keep the old session if
+             * that also fails (e.g. corrupt/replayed message). */
+            wa_sig_session_t old = *ss;
+            if (init_responder_session(s, ss, &pk) == 0) {
+                snprintf(ss->addr, sizeof(ss->addr), "%s", addr_copy);
+                rc = decrypt_whisper(s, ss, inner, innerlen, out, outlen);
+                if (!rc)
+                    was_new = 1;
+                else
+                    *ss = old;
+            }
+        }
         free(inner);
         if (!rc && was_new && pk.has_prekey_id) {
             opk_remove(s, pk.prekey_id);
@@ -816,6 +846,16 @@ int wa_sig_encrypt_pkmsg(wa_sig_t *s, const char *addr, const wa_bundle_t *b,
     memset(zeros, 0, 32);
     if (!s || !addr || !b || !pt || !out || !outlen)
         return -1;
+    /* Authenticate the bundle's signed prekey before doing X3DH. WhatsApp
+     * signs 0x05 || signed-prekey-pub with the peer identity key. */
+    {
+        uint8_t signed_spk[33];
+        signed_spk[0] = 5;
+        memcpy(signed_spk + 1, b->spk, 32);
+        if (wa_xeddsa_verify(b->identity, signed_spk, sizeof(signed_spk),
+                             b->spk_sig))
+            return -1;
+    }
     if (RAND_bytes(base_priv, 32) != 1 || RAND_bytes(eph_priv, 32) != 1)
         return -1;
     if (wa_x25519_pub(base_pub, base_priv) || wa_x25519_pub(eph_pub, eph_priv))
@@ -952,9 +992,21 @@ int wa_sig_encrypt_pkmsg(wa_sig_t *s, const char *addr, const wa_bundle_t *b,
         wa_pbw_free(&pre);
     }
 
-    /* persist the initiator session so replies can be decrypted */
-    sess = session_create(s, addr);
-    if (sess) {
+    /* Persist the initiator session so replies can be decrypted. If a
+     * session already exists, replace it: a fresh pkmsg means a new base
+     * key, so the old chains are no longer valid. */
+    sess = session_find(s, addr);
+    if (sess)
+        memset(sess, 0, sizeof(*sess));
+    else
+        sess = session_create(s, addr);
+    if (!sess) {
+        free(body);
+        *out = NULL;
+        *outlen = 0;
+        return -1;
+    }
+    {
         sess->used = 1;
         snprintf(sess->addr, sizeof(sess->addr), "%s", addr);
         memcpy(sess->remote_identity, their_id33, 33);
