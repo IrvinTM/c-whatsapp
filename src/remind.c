@@ -5,15 +5,19 @@
 #include "wa_remind.h"
 
 #include <ctype.h>
+#include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/file.h>
+#include <unistd.h>
 
 static const char *DNAMES[] = { "Sun", "Mon", "Tue", "Wed",
                                 "Thu", "Fri", "Sat" };
 
-static const char *REPEAT_NAMES[] = { "once", "daily", "weekly" };
+static const char *REPEAT_NAMES[] = { "once", "daily", "weekly", "nag" };
+#define N_REPEAT 4
 
 static int day_index(const char *s) {
     char low[8];
@@ -188,13 +192,43 @@ static int date_weekday(const char *date) {
     return dt.tm_wday;
 }
 
+/* "UTC", "UTC-6", "UTC+5:30". */
+static void fmt_tz(int off, char tz[16]) {
+    if (off == 0)
+        snprintf(tz, 16, "UTC");
+    else if (off % 60)
+        snprintf(tz, 16, "UTC%c%d:%02d", off < 0 ? '-' : '+', abs(off) / 60,
+                 abs(off) % 60);
+    else
+        snprintf(tz, 16, "UTC%c%d", off < 0 ? '-' : '+', abs(off) / 60);
+}
+
+/* "30 min", "1h", "1h30m", "24h". */
+static void fmt_interval(int min, char out[16]) {
+    if (min < 60)
+        snprintf(out, 16, "%d min", min);
+    else if (min % 60)
+        snprintf(out, 16, "%dh%dm", min / 60, min % 60);
+    else
+        snprintf(out, 16, "%dh", min / 60);
+}
+
 static void rem_path(const char *auth_dir, char out[512]) {
     snprintf(out, 512, "%s/reminders.tsv", auth_dir ? auth_dir : "auth_info");
 }
 
+/* Whole-string decimal -> *out, 0 on success. */
+static int rem_num(const char *s, long long *out) {
+    char *end;
+    if (!*s)
+        return -1;
+    *out = strtoll(s, &end, 10);
+    return *end ? -1 : 0;
+}
+
 /* Map a repeat name to the enum, -1 if unknown. */
 static int repeat_index(const char *s) {
-    for (int i = 0; i < 3; i++)
+    for (int i = 0; i < N_REPEAT; i++)
         if (!strcmp(s, REPEAT_NAMES[i]))
             return i;
     return -1;
@@ -214,7 +248,7 @@ int wa_rem_load(const char *auth_dir, wa_reminder_t *out, int cap) {
     while ((n = getline(&line, &ll, f)) >= 0) {
         wa_reminder_t r;
         char *fld[8];
-        int nf = 0;
+        int nf = 0, bad = 0;
         char *p;
         if (n > 0 && line[n - 1] == '\n')
             line[--n] = '\0';
@@ -224,6 +258,8 @@ int wa_rem_load(const char *auth_dir, wa_reminder_t *out, int cap) {
         p = line;
         while (nf < 8) {
             fld[nf++] = p;
+            if (nf == 8)
+                break; /* the 8th field is the rest of the line */
             p = strchr(p, '\t');
             if (!p)
                 break;
@@ -245,6 +281,29 @@ int wa_rem_load(const char *auth_dir, wa_reminder_t *out, int cap) {
             if (wa_rem_time_parse(hm, &r.hour, &r.min))
                 continue;
             snprintf(r.to, sizeof(r.to), "%s", fld[6]);
+            if (r.repeat == WA_REM_NAG) {
+                /* v3: text interval_min next_fire sent; the text is
+                 * whatever precedes the last three tabs */
+                char *tail[3], *e = fld[7];
+                long long iv = 0, nx = 0, sn = 0;
+                for (int k = 2; k >= 0 && !bad; k--) {
+                    char *tab = strrchr(e, '\t');
+                    if (!tab) {
+                        bad = 1;
+                        break;
+                    }
+                    *tab = '\0';
+                    tail[k] = tab + 1;
+                }
+                if (bad || rem_num(tail[0], &iv) || rem_num(tail[1], &nx) ||
+                    rem_num(tail[2], &sn) || iv < WA_REM_NAG_MIN_INTERVAL ||
+                    iv > WA_REM_NAG_MAX_INTERVAL || nx <= 0 || sn < 0 ||
+                    sn > 1000000)
+                    continue;
+                r.interval_min = (int)iv;
+                r.next_fire = (time_t)nx;
+                r.sent = (int)sn;
+            }
             snprintf(r.text, sizeof(r.text), "%s", fld[7]);
         } else if (nf == 5) {
             /* legacy: id days hh:mm to text (weekly, server local time) */
@@ -273,37 +332,140 @@ int wa_rem_load(const char *auth_dir, wa_reminder_t *out, int cap) {
     return cnt;
 }
 
+/* Tabs and line breaks would split a record, so they become spaces. */
+static void rem_clean(char *dst, size_t cap, const char *src) {
+    snprintf(dst, cap, "%s", src);
+    for (char *p = dst; *p; p++)
+        if (*p == '\t' || *p == '\r' || *p == '\n')
+            *p = ' ';
+}
+
+/* One reminder as a line: 8 fields, or 11 for a nag (v3). */
+static void rem_write_line(FILE *f, const wa_reminder_t *r) {
+    char ds[64], to[WA_REM_TO_MAX], text[WA_REM_TEXT_MAX];
+    int rep = r->repeat >= 0 && r->repeat < N_REPEAT ? r->repeat : WA_REM_ONCE;
+    if (rep == WA_REM_WEEKLY)
+        wa_rem_days_format(r->days, ds);
+    else
+        snprintf(ds, sizeof(ds), "-");
+    rem_clean(to, sizeof(to), r->to);
+    rem_clean(text, sizeof(text), r->text);
+    fprintf(f, "%d\t%s\t%02d:%02d\t%d\t%s\t%s\t%s\t%s", r->id,
+            r->date[0] ? r->date : "-", r->hour, r->min, r->tz_min,
+            REPEAT_NAMES[rep], ds, to, text);
+    if (rep == WA_REM_NAG)
+        fprintf(f, "\t%d\t%lld\t%d", r->interval_min,
+                (long long)r->next_fire, r->sent);
+    fputc('\n', f);
+}
+
+/* Replace the file with all[0..n) minus skip_id, via a temp file + rename.
+ * Returns 0 on success. */
+static int rem_rewrite(const char *auth_dir, const wa_reminder_t *all, int n,
+                       int skip_id) {
+    char path[512], tmp[520];
+    FILE *f;
+    int bad;
+    rem_path(auth_dir, path);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "w");
+    if (!f)
+        return -1;
+    for (int i = 0; i < n; i++)
+        if (all[i].id != skip_id)
+            rem_write_line(f, &all[i]);
+    bad = ferror(f);
+    if (fclose(f) || bad || rename(tmp, path)) {
+        unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+/* Exclusive lock around read-modify-write of the store (the daemon and the
+ * CLI can both edit it). Returns an fd for rem_unlock, -1 on failure. */
+static int rem_lock(const char *auth_dir) {
+    char path[512];
+    int fd;
+    snprintf(path, sizeof(path), "%s/reminders.lock",
+             auth_dir ? auth_dir : "auth_info");
+    fd = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return -1;
+    if (flock(fd, LOCK_EX)) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void rem_unlock(int fd) {
+    flock(fd, LOCK_UN);
+    close(fd);
+}
+
+void wa_rem_from_spec(wa_reminder_t *out, int id, const wa_rem_spec_t *s) {
+    memset(out, 0, sizeof(*out));
+    out->id = id;
+    out->days = s->days;
+    out->hour = s->hour;
+    out->min = s->min;
+    out->tz_min = s->tz_min;
+    out->repeat = s->repeat;
+    snprintf(out->date, sizeof(out->date), "%s", s->date);
+    snprintf(out->to, sizeof(out->to), "%s", s->to);
+    snprintf(out->text, sizeof(out->text), "%s", s->text);
+    out->interval_min = s->interval_min;
+    out->next_fire = s->next_fire;
+    out->sent = s->sent;
+}
+
 int wa_rem_add_spec(const char *auth_dir, const wa_rem_spec_t *s) {
-    char path[512], ds[64];
-    wa_reminder_t *cur;
-    int n, nid = 1;
+    char path[512];
+    wa_reminder_t *cur, r;
+    int n, nid = 1, nags = 0, lk, rc = -1;
     FILE *f;
     if (!s || !s->to[0] || !s->text[0])
         return -1;
     if (s->hour < 0 || s->hour > 23 || s->min < 0 || s->min > 59)
         return -1;
+    if (s->repeat == WA_REM_NAG &&
+        (s->interval_min < WA_REM_NAG_MIN_INTERVAL ||
+         s->interval_min > WA_REM_NAG_MAX_INTERVAL || s->next_fire <= 0 ||
+         s->sent < 0))
+        return -1;
     cur = malloc(sizeof(*cur) * WA_REM_MAX);
     if (!cur)
         return -1;
+    lk = rem_lock(auth_dir);
+    if (lk < 0) {
+        free(cur);
+        return -1;
+    }
     n = wa_rem_load(auth_dir, cur, WA_REM_MAX);
-    for (int i = 0; i < n; i++)
+    for (int i = 0; i < n; i++) {
         if (cur[i].id >= nid)
             nid = cur[i].id + 1;
+        if (cur[i].repeat == WA_REM_NAG)
+            nags++;
+    }
+    if (n >= WA_REM_MAX)
+        rc = WA_REM_ERR_FULL;
+    else if (s->repeat == WA_REM_NAG && nags >= WA_REM_NAG_MAX_ACTIVE)
+        rc = WA_REM_ERR_NAGS;
+    else {
+        wa_rem_from_spec(&r, nid, s);
+        rem_path(auth_dir, path);
+        f = fopen(path, "a");
+        if (f) {
+            rem_write_line(f, &r);
+            if (fclose(f) == 0)
+                rc = nid;
+        }
+    }
+    rem_unlock(lk);
     free(cur);
-    rem_path(auth_dir, path);
-    f = fopen(path, "a");
-    if (!f)
-        return -1;
-    if (s->repeat == WA_REM_WEEKLY)
-        wa_rem_days_format(s->days, ds);
-    else
-        snprintf(ds, sizeof(ds), "-");
-    fprintf(f, "%d\t%s\t%02d:%02d\t%d\t%s\t%s\t%s\t%s\n", nid,
-            s->date[0] ? s->date : "-", s->hour, s->min, s->tz_min,
-            s->repeat >= 0 && s->repeat <= 2 ? REPEAT_NAMES[s->repeat] : "once",
-            ds, s->to, s->text);
-    fclose(f);
-    return nid;
+    return rc;
 }
 
 int wa_rem_add(const char *auth_dir, unsigned days, int hour, int min,
@@ -323,50 +485,83 @@ int wa_rem_add(const char *auth_dir, unsigned days, int hour, int min,
 }
 
 int wa_rem_del(const char *auth_dir, int id) {
-    char path[512], tmp[520];
     wa_reminder_t *cur = malloc(sizeof(*cur) * WA_REM_MAX);
-    int n, found = 0;
-    FILE *f;
+    int n, found = 0, lk, rc = -1;
     if (!cur)
         return -1;
+    lk = rem_lock(auth_dir);
+    if (lk < 0) {
+        free(cur);
+        return -1;
+    }
     n = wa_rem_load(auth_dir, cur, WA_REM_MAX);
     for (int i = 0; i < n; i++)
         if (cur[i].id == id)
             found = 1;
-    if (!found) {
-        free(cur);
-        return -1;
-    }
-    rem_path(auth_dir, path);
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    f = fopen(tmp, "w");
-    if (!f) {
-        free(cur);
-        return -1;
-    }
-    for (int i = 0; i < n; i++) {
-        char ds[64];
-        if (cur[i].id == id)
-            continue;
-        if (cur[i].repeat == WA_REM_WEEKLY)
-            wa_rem_days_format(cur[i].days, ds);
-        else
-            snprintf(ds, sizeof(ds), "-");
-        fprintf(f, "%d\t%s\t%02d:%02d\t%d\t%s\t%s\t%s\t%s\n", cur[i].id,
-                cur[i].date[0] ? cur[i].date : "-", cur[i].hour, cur[i].min,
-                cur[i].tz_min, REPEAT_NAMES[cur[i].repeat], ds, cur[i].to,
-                cur[i].text);
-    }
-    fclose(f);
-    rename(tmp, path);
+    if (found && rem_rewrite(auth_dir, cur, n, id) == 0)
+        rc = 0;
+    rem_unlock(lk);
     free(cur);
-    return 0;
+    return rc;
+}
+
+time_t wa_rem_nag_jitter(time_t nominal, time_t now, uint32_t rnd) {
+    int j = (int)(rnd % (2 * WA_REM_NAG_JITTER_S + 1)) - WA_REM_NAG_JITTER_S;
+    time_t t = nominal + j;
+    if (t < now + WA_REM_NAG_MIN_GAP_S)
+        t = now + WA_REM_NAG_MIN_GAP_S;
+    return t;
+}
+
+time_t wa_rem_nag_next(const wa_reminder_t *r, time_t now, uint32_t rnd) {
+    /* Count from the scheduled time so polling lag never accumulates, but
+     * after an outage start over from now: one catch-up send, no burst. */
+    time_t base = (now - r->next_fire <= WA_REM_NAG_LATE_S) ? r->next_fire
+                                                            : now;
+    return wa_rem_nag_jitter(base + (time_t)r->interval_min * 60, now, rnd);
+}
+
+int wa_rem_nag_due(const wa_reminder_t *r, time_t now) {
+    return r && r->repeat == WA_REM_NAG && r->next_fire <= now;
+}
+
+int wa_rem_nag_advance(const char *auth_dir, int id, time_t expect_next,
+                       time_t new_next, int new_sent) {
+    wa_reminder_t *cur = malloc(sizeof(*cur) * WA_REM_MAX);
+    int n, lk, rc = -1;
+    if (!cur)
+        return -1;
+    lk = rem_lock(auth_dir);
+    if (lk < 0) {
+        free(cur);
+        return -1;
+    }
+    n = wa_rem_load(auth_dir, cur, WA_REM_MAX);
+    for (int i = 0; i < n; i++) {
+        if (cur[i].id != id)
+            continue;
+        if (cur[i].repeat != WA_REM_NAG || cur[i].next_fire != expect_next)
+            break;
+        if (new_sent >= WA_REM_NAG_MAX_SENDS) {
+            if (rem_rewrite(auth_dir, cur, n, id) == 0)
+                rc = 1;
+        } else if (new_sent >= 0 && new_next > 0) {
+            cur[i].next_fire = new_next;
+            cur[i].sent = new_sent;
+            if (rem_rewrite(auth_dir, cur, n, -1) == 0)
+                rc = 0;
+        }
+        break;
+    }
+    rem_unlock(lk);
+    free(cur);
+    return rc;
 }
 
 int wa_rem_due(const wa_reminder_t *r, time_t now) {
     struct tm w;
     char today[32];
-    if (!r)
+    if (!r || r->repeat == WA_REM_NAG) /* nags run on next_fire */
         return 0;
     wall_tm(r->tz_min, now, &w);
     if (w.tm_hour != r->hour || w.tm_min != r->min)
@@ -565,22 +760,23 @@ int wa_rem_parse_cmd(const char *body, const char *default_to,
 }
 
 void wa_rem_fmt_schedule(const wa_reminder_t *r, char *out, size_t cap) {
-    char tz[16], rep[64];
-    int off;
+    char tz[16], rep[96];
     if (!r || !out || !cap)
         return;
-    off = r->tz_min;
-    if (off == 0)
-        snprintf(tz, sizeof(tz), "UTC");
-    else
-        snprintf(tz, sizeof(tz), "UTC%c%d:%02d", off < 0 ? '-' : '+',
-                 abs(off) / 60, abs(off) % 60);
-    if (r->repeat == WA_REM_ONCE)
+    fmt_tz(r->tz_min, tz);
+    if (r->repeat == WA_REM_ONCE) {
         snprintf(rep, sizeof(rep), "once");
-    else if (r->repeat == WA_REM_DAILY)
+    } else if (r->repeat == WA_REM_DAILY) {
         snprintf(rep, sizeof(rep), "daily");
-    else
+    } else if (r->repeat == WA_REM_NAG) {
+        struct tm w;
+        wall_tm(r->tz_min, r->next_fire, &w);
+        snprintf(rep, sizeof(rep), "every %dm next %04d-%02d-%02d %02d:%02d "
+                 "sent %d", r->interval_min, w.tm_year + 1900, w.tm_mon + 1,
+                 w.tm_mday, w.tm_hour, w.tm_min, r->sent);
+    } else {
         wa_rem_days_format(r->days, rep);
+    }
     if (r->date[0])
         snprintf(out, cap, "%s %02d:%02d %s %s", r->date, r->hour, r->min,
                  tz, rep);
@@ -854,15 +1050,21 @@ static int nl_delay(const nl_toks_t *t, int i, long *minutes) {
     return 1;
 }
 
-/* Parses the WHEN part at *ip. Returns 0 or an error via nl_set_err. */
+/* Parses the WHEN part at *ip. Returns 0 or an error via nl_set_err.
+ * *every: 1 daily, 2 weekly on *mask, 3 nag every *interval minutes. */
 static int nl_when(const nl_toks_t *t, int *ip, time_t now, int tz_min,
                    wa_rem_spec_t *out, int *every, unsigned *mask,
-                   int *day_off, int *weekday, char *err, size_t errcap) {
-    int i = *ip, d, plural = 0;
+                   long *interval, int *day_off, int *weekday, char *err,
+                   size_t errcap) {
+    int i = *ip, d, plural = 0, used;
     const char *w = nl_at(t, i);
 
     if (!strcmp(w, "daily") || !strcmp(w, "everyday")) {
         *every = 1;
+        i++;
+    } else if (!strcmp(w, "hourly")) {
+        *every = 3;
+        *interval = 60;
         i++;
     } else if (!strcmp(w, "weekdays")) {
         *every = 2;
@@ -899,10 +1101,21 @@ static int nl_when(const nl_toks_t *t, int *ip, time_t now, int tz_min,
                 }
                 *mask |= more;
             }
+        } else if (!strcmp(a, "hour") || !strcmp(a, "hr")) {
+            *every = 3;
+            *interval = 60;
+        } else if (!strcmp(a, "half") && !strcmp(nl_at(t, i), "hour")) {
+            *every = 3;
+            *interval = 30;
+            i++;
+        } else if ((used = nl_delay(t, i - 1, interval)) != 0) {
+            *every = 3;
+            i += used - 1;
         } else {
             return nl_set_err(err, errcap,
-                              "after \"every\" use day, weekday, weekend or "
-                              "day names like sat or mon,wed");
+                              "after \"every\" use day, weekday, weekend, "
+                              "day names like sat or mon,wed, or an interval "
+                              "like 2 hours");
         }
     } else if (!strcmp(w, "today")) {
         *day_off = 0;
@@ -953,7 +1166,7 @@ int wa_rem_parse_request(const char *text, time_t now, int tz_min,
     char buf[1024];
     nl_toks_t t;
     int i, used = 0, every = 0, day_off = -1, weekday = -1;
-    long delay = 0;
+    long delay = 0, interval = 0;
     unsigned mask = 0;
     struct tm w;
 
@@ -976,18 +1189,44 @@ int wa_rem_parse_request(const char *text, time_t now, int tz_min,
                               "in 1h30m");
         i += 1 + used;
     } else {
-        if (nl_when(&t, &i, now, tz_min, out, &every, &mask, &day_off,
-                    &weekday, err, errcap))
+        if (nl_when(&t, &i, now, tz_min, out, &every, &mask, &interval,
+                    &day_off, &weekday, err, errcap))
             return -1;
-        if (!strcmp(nl_at(&t, i), "at"))
-            i++;
-        used = nl_clock(nl_at(&t, i), nl_at(&t, i + 1), 1, &out->hour,
-                        &out->min);
-        if (!used)
-            return nl_set_err(err, errcap,
-                              "I need a time after the day, like 13:00 or "
-                              "1pm");
-        i += used;
+        if (every == 3) {
+            /* a nag starts now, so it takes no clock time */
+            const char *x;
+            int h, m;
+            if (!strcmp(nl_at(&t, i), "until") ||
+                !strcmp(nl_at(&t, i), "till") || !strcmp(nl_at(&t, i), "til")) {
+                if (!strcmp(nl_at(&t, i + 1), "done"))
+                    i += 2;
+            }
+            x = nl_at(&t, i);
+            if (!strcmp(x, "at") || !strcmp(x, "from") ||
+                !strcmp(x, "starting") || nl_clock(x, nl_at(&t, i + 1), 1, &h, &m))
+                return nl_set_err(err, errcap,
+                                  "repeating reminders start now; drop the "
+                                  "time, e.g. reminder every hour take pills");
+            if (interval < WA_REM_NAG_MIN_INTERVAL)
+                return nl_set_err(err, errcap,
+                                  "repeating reminders must be at least 15 "
+                                  "minutes apart");
+            if (interval > WA_REM_NAG_MAX_INTERVAL)
+                return nl_set_err(err, errcap,
+                                  "repeating reminders can be at most 24 "
+                                  "hours apart, for longer use every day "
+                                  "08:00");
+        } else {
+            if (!strcmp(nl_at(&t, i), "at"))
+                i++;
+            used = nl_clock(nl_at(&t, i), nl_at(&t, i + 1), 1, &out->hour,
+                            &out->min);
+            if (!used)
+                return nl_set_err(err, errcap,
+                                  "I need a time after the day, like 13:00 "
+                                  "or 1pm");
+            i += used;
+        }
     }
 
     /* Everything after the schedule is the text, exactly as typed. Only
@@ -1024,6 +1263,16 @@ int wa_rem_parse_request(const char *text, time_t now, int tz_min,
         out->min = w.tm_min;
         nl_fmt_date(out->date, w.tm_year + 1900, w.tm_mon + 1, w.tm_mday);
         out->repeat = WA_REM_ONCE;
+        return 0;
+    }
+    if (every == 3) {
+        wall_tm(tz_min, now, &w);
+        out->hour = w.tm_hour;
+        out->min = w.tm_min;
+        nl_fmt_date(out->date, w.tm_year + 1900, w.tm_mon + 1, w.tm_mday);
+        out->repeat = WA_REM_NAG;
+        out->interval_min = (int)interval;
+        out->next_fire = now + (time_t)interval * 60; /* caller adds jitter */
         return 0;
     }
     if (every == 1) {
@@ -1069,17 +1318,25 @@ void wa_rem_describe(const wa_reminder_t *r, time_t now, char *out,
                                        "May", "Jun", "Jul", "Aug",
                                        "Sep", "Oct", "Nov", "Dec" };
     char tz[16], when[96];
-    int off;
     if (!r || !out || !cap)
         return;
-    off = r->tz_min;
-    if (off == 0)
-        snprintf(tz, sizeof(tz), "UTC");
-    else if (off % 60)
-        snprintf(tz, sizeof(tz), "UTC%c%d:%02d", off < 0 ? '-' : '+',
-                 abs(off) / 60, abs(off) % 60);
-    else
-        snprintf(tz, sizeof(tz), "UTC%c%d", off < 0 ? '-' : '+', abs(off) / 60);
+    fmt_tz(r->tz_min, tz);
+    if (r->repeat == WA_REM_NAG) {
+        char iv[16], sent[24] = "", day[8] = "", a[WA_REM_DATE_LEN + 1];
+        char b[WA_REM_DATE_LEN + 1];
+        struct tm w;
+        fmt_interval(r->interval_min, iv);
+        if (r->sent > 0)
+            snprintf(sent, sizeof(sent), " (%d sent)", r->sent);
+        wall_tm(r->tz_min, r->next_fire, &w);
+        nl_date_plus(r->tz_min, r->next_fire, 0, a);
+        nl_date_plus(r->tz_min, now, 0, b);
+        if (strcmp(a, b))
+            snprintf(day, sizeof(day), "%s ", DNAMES[w.tm_wday]);
+        snprintf(out, cap, "every ~%s until done%s, next ~%s%02d:%02d %s", iv,
+                 sent, day, w.tm_hour, w.tm_min, tz);
+        return;
+    }
     if (r->repeat == WA_REM_ONCE && r->date[0]) {
         char today[WA_REM_DATE_LEN + 1], tmrw[WA_REM_DATE_LEN + 1];
         int y, mo, d, wd = date_weekday(r->date);
@@ -1113,4 +1370,50 @@ void wa_rem_describe(const wa_reminder_t *r, time_t now, char *out,
         size_t n = strlen(out);
         snprintf(out + n, cap - n, " from %s", r->date);
     }
+}
+
+/* Cut a UTF-8 string that was truncated by snprintf back to a whole char. */
+static void utf8_trim(char *out, size_t cap) {
+    size_t n = strlen(out), j;
+    if (n < cap - 1 || !n)
+        return;
+    j = n;
+    while (j > 0 && ((unsigned char)out[j - 1] & 0xC0) == 0x80)
+        j--;
+    if (j > 0) {
+        unsigned char c = (unsigned char)out[j - 1];
+        size_t need = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        if (need > n - (j - 1))
+            out[j - 1] = '\0';
+    }
+}
+
+void wa_rem_nag_text(const wa_reminder_t *r, char *out, size_t cap) {
+    static const char ALARM[] = "\xe2\x8f\xb0 ";
+    if (!r || !out || !cap)
+        return;
+    if (r->sent + 1 >= WA_REM_NAG_MAX_SENDS) {
+        snprintf(out, cap,
+                 "%sLast reminder: %s\nI'll stop reminding you about #%d now.",
+                 ALARM, r->text, r->id);
+    } else if (r->sent <= 0) {
+        snprintf(out, cap, "%s%s\nReply *done %d* when it's done.", ALARM,
+                 r->text, r->id);
+    } else {
+        switch (r->sent % 3) {
+        case 0:
+            snprintf(out, cap, "%s%s\nStill pending? Reply *done %d* once "
+                     "it's done.", ALARM, r->text, r->id);
+            break;
+        case 1:
+            snprintf(out, cap, "%s%s\nReminder %d. Send *done %d* to stop "
+                     "these.", ALARM, r->text, r->sent + 1, r->id);
+            break;
+        default:
+            snprintf(out, cap, "%s%s\nSend *done %d* when you're finished.",
+                     ALARM, r->text, r->id);
+            break;
+        }
+    }
+    utf8_trim(out, cap);
 }
