@@ -7,11 +7,24 @@ CFLAGS  ?= -std=c11 -Wall -Wextra -Wpedantic -g
 CPPFLAGS += -Iinclude
 LDLIBS  += -lssl -lcrypto -lz -lsodium -lqrencode
 
+# Size-first build: "make tiny" -> build/tiny/c-whatsapp (stripped, LTO, -Os).
+TINY_CFLAGS := -std=c11 -Wall -Wextra -Wpedantic -Os -DNDEBUG \
+               -ffunction-sections -fdata-sections -flto \
+               -fno-unwind-tables -fno-asynchronous-unwind-tables
+TINY_LDFLAGS := -flto -Wl,--gc-sections -Wl,-O1 -s
+
 BUILD   := build
 LIB_SRC := src/binary.c src/auth.c src/crypto.c src/noise.c src/pb.c src/ws.c src/pairing.c src/socket.c src/send.c src/qr.c src/remind.c src/signal.c
 LIB_OBJ := $(patsubst src/%.c,$(BUILD)/%.o,$(LIB_SRC))
 
 all: $(BUILD)/c-whatsapp
+
+# Build the deployment binary in its own object dir so debug/tiny objects
+# never mix. The output is stripped and should be a small fraction of -g.
+tiny:
+	$(MAKE) BUILD=$(BUILD)/tiny CFLAGS="$(TINY_CFLAGS)" \
+		LDFLAGS="$(TINY_LDFLAGS)" $(BUILD)/tiny/c-whatsapp
+	@ls -lh $(BUILD)/tiny/c-whatsapp
 
 $(BUILD):
 	mkdir -p $(BUILD)
@@ -51,4 +64,4 @@ test: all $(BUILD)/test_binary $(BUILD)/test_auth $(BUILD)/test_noise $(BUILD)/t
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test clean
+.PHONY: all tiny test clean

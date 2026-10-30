@@ -67,6 +67,12 @@ typedef struct {
     const char *text; /* optional: text to send with to_jid */
     int daemon; /* keep running, poll reminders.tsv and send due */
     int listen; /* stay online and handle inbound messages (no polling) */
+    int read_receipts; /* send read receipts for inbound messages */
+    int receipt_wait_ms; /* post-send receipt listen (0 = 15000) */
+    /* Comma-separated phone numbers allowed to manage reminders over chat
+     * (CWA_ALLOW). NULL/empty disables chat commands entirely. */
+    const char *allow;
+    int tz_min; /* default timezone for chat requests (minutes east of UTC) */
     int connect_timeout_ms; /* 0 = 20000 */
     int run_timeout_ms; /* 0 = no overall timeout */
 } wa_conn_opts_t;

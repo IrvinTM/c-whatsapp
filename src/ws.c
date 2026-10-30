@@ -63,7 +63,7 @@ static int ssl_write_all(SSL *ssl, int fd, const uint8_t *p, size_t n,
 static int ssl_read_all(SSL *ssl, int fd, uint8_t *p, size_t n,
                         int timeout_ms) {
     while (n) {
-        if (SSL_pending(ssl) <= 0 && wait_fd(fd, 0, timeout_ms))
+        if (!SSL_has_pending(ssl) && wait_fd(fd, 0, timeout_ms))
             return -1;
         int rc = SSL_read(ssl, p, (int)n);
         if (rc > 0) {
@@ -109,7 +109,9 @@ int wa_ws_connect(wa_ws_t *ws, const char *host, const char *port,
     SSL *ssl = NULL;
     char req[2048];
     char resp[16384];
-    uint8_t key_raw[16];
+    /* 16 random bytes; two zero pad bytes let the 3-byte base64 loop read
+     * past the random input without touching uninitialized memory. */
+    uint8_t key_raw[18] = { 0 };
     char key_b64[32];
     int rc = -1;
 
@@ -123,7 +125,7 @@ int wa_ws_connect(wa_ws_t *ws, const char *host, const char *port,
         static const char *B64 =
             "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
         size_t o = 0;
-        if (RAND_bytes(key_raw, sizeof(key_raw)) != 1)
+        if (RAND_bytes(key_raw, 16) != 1)
             return -1;
         for (int i = 0; i < 16; i += 3) {
             uint32_t v = (uint32_t)key_raw[i] << 16 |
@@ -345,7 +347,7 @@ wa_ws_msg_t wa_ws_recv(wa_ws_t *ws, uint8_t **payload, size_t *len,
         int fin;
         uint8_t *p = NULL;
         size_t n = 0;
-        if (SSL_pending(ws->ssl) <= 0 && wait_fd(ws->fd, 0, timeout_ms)) {
+        if (!SSL_has_pending(ws->ssl) && wait_fd(ws->fd, 0, timeout_ms)) {
             free(msg);
             return WA_WS_TIMEOUT;
         }

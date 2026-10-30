@@ -32,7 +32,8 @@ static void usage(const char *argv0) {
     printf("  --auth-dir DIR   session dir (default: auth_info)\n");
     printf("  --qr             link a new device via QR (default when no session)\n");
     printf("  --pair NUMBER    link via 8-digit code (digits + country code)\n");
-    printf("  --timeout SECS   overall run timeout (default: 180, 0 = forever)\n");
+    printf("  --timeout SECS   overall run timeout (default: 180; 0 = forever;\n");
+    printf("                   --listen/--daemon default to forever)\n");
     printf("  --name NAME      push name sent in ClientPayload\n");
     printf("  --to JID         recipient (actually sends)\n");
     printf("  --text MSG       message text (actually sends)\n");
@@ -41,6 +42,11 @@ static void usage(const char *argv0) {
     printf("  --remind-del ID  delete reminder\n");
     printf("  --daemon         keep running, send due reminders (polls 15s)\n");
     printf("  --listen         stay online, decrypt messages, fire reminders, handle /reminder\n");
+    printf("  --read-receipts  send read receipts for inbound messages (listen/daemon)\n");
+    printf("  --allow NUMS     numbers allowed to manage reminders over chat\n");
+    printf("                   (comma-separated; default: $CWA_ALLOW)\n");
+    printf("  --tz OFFSET      default timezone for chat reminders, e.g. UTC-6\n");
+    printf("                   (default: $CWA_TZ, else system local time)\n");
     printf("  -h, --help       this help\n");
 }
 
@@ -88,13 +94,20 @@ int main(int argc, char **argv) {
     const char *push_name = NULL;
     const char *pair_number = NULL;
     int timeout_secs = 180;
+    int timeout_set = 0;
     int want_qr = 0;
     int want_daemon = 0;
     int want_listen = 0;
+    int want_read_receipts = 0;
+    const char *allow = getenv("CWA_ALLOW");
+    const char *tz_arg = getenv("CWA_TZ");
     int want_list = 0;
     int want_del = -1;
     const char *ra_days = NULL, *ra_time = NULL, *ra_to = NULL;
     const char *ra_text = NULL;
+
+    /* Line-buffer logs so journald / redirected files see them promptly. */
+    setvbuf(stdout, NULL, _IOLBF, 0);
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
@@ -108,6 +121,12 @@ int main(int argc, char **argv) {
             want_daemon = 1;
         } else if (!strcmp(argv[i], "--listen")) {
             want_listen = 1;
+        } else if (!strcmp(argv[i], "--read-receipts")) {
+            want_read_receipts = 1;
+        } else if (!strcmp(argv[i], "--allow") && i + 1 < argc) {
+            allow = argv[++i];
+        } else if (!strcmp(argv[i], "--tz") && i + 1 < argc) {
+            tz_arg = argv[++i];
         } else if (!strcmp(argv[i], "--remind-list")) {
             want_list = 1;
         } else if (!strcmp(argv[i], "--remind-del") && i + 1 < argc) {
@@ -137,6 +156,7 @@ int main(int argc, char **argv) {
             pair_number = argv[++i];
         } else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) {
             timeout_secs = atoi(argv[++i]);
+            timeout_set = 1;
         } else if (!strcmp(argv[i], "--name") && i + 1 < argc) {
             push_name = argv[++i];
         } else if (!strcmp(argv[i], "--to") && i + 1 < argc) {
@@ -274,10 +294,21 @@ int main(int argc, char **argv) {
     opts.text = text;
     opts.daemon = want_daemon;
     opts.listen = want_listen;
+    opts.read_receipts = want_read_receipts;
+    opts.allow = allow;
+    opts.tz_min = wa_rem_local_offset();
+    if (tz_arg && *tz_arg && wa_rem_tz_parse(tz_arg, &opts.tz_min)) {
+        fprintf(stderr, "bad timezone '%s' (use e.g. UTC-6)\n", tz_arg);
+        return 2;
+    }
+    opts.receipt_wait_ms = (want_daemon || want_listen) ? 3000 : 15000;
     opts.on_message = on_message;
-    opts.run_timeout_ms = timeout_secs * 1000;
-    if (want_daemon)
-        opts.run_timeout_ms = timeout_secs > 0 ? timeout_secs * 1000 : 0;
+    /* Daemons and listeners are services: run until stopped unless the
+     * caller explicitly asked for a timeout. */
+    if (timeout_set)
+        opts.run_timeout_ms = timeout_secs * 1000;
+    else
+        opts.run_timeout_ms = (want_daemon || want_listen) ? 0 : 180000;
 
     if (want_daemon || want_listen) {
         if (!creds.me_id[0]) {

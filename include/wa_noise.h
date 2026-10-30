@@ -102,6 +102,9 @@ int wa_noise_encode_frame(wa_noise_t *n, const uint8_t *payload,
 
 /* Feed received bytes; emits frames via cb (decrypted if transport).
  * Returns frames emitted, or -1 on decrypt/alloc error. */
+/* 1 if a complete frame is already buffered (left behind when a callback
+ * stopped the previous feed). Feed NULL/0 to process it. */
+int wa_noise_pending(const wa_noise_t *n);
 int wa_noise_feed(wa_noise_t *n, const uint8_t *data, size_t len,
                   wa_frame_cb cb, void *user);
 

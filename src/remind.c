@@ -588,3 +588,732 @@ void wa_rem_fmt_schedule(const wa_reminder_t *r, char *out, size_t cap) {
     else
         snprintf(out, cap, "%02d:%02d %s %s", r->hour, r->min, tz, rep);
 }
+
+/* ---------------- natural-language requests ---------------- */
+
+#define NL_MAX_TOK 96
+
+typedef struct {
+    char *orig[NL_MAX_TOK]; /* token as typed (for the reminder text) */
+    char low[NL_MAX_TOK][48]; /* lowercased, edge punctuation stripped */
+    int used[NL_MAX_TOK];
+    int n;
+} nl_toks_t;
+
+static void nl_tokenize(char *buf, nl_toks_t *t) {
+    memset(t, 0, sizeof(*t));
+    for (char *s = strtok(buf, " \t\r\n"); s && t->n < NL_MAX_TOK;
+         s = strtok(NULL, " \t\r\n")) {
+        char *lw = t->low[t->n];
+        size_t a = 0, b = strlen(s), k = 0;
+        while (a < b && strchr("\"'(", s[a]))
+            a++;
+        while (b > a && strchr(",.!?;:\"')", s[b - 1]))
+            b--;
+        for (size_t i = a; i < b && k + 1 < sizeof(t->low[0]); i++)
+            lw[k++] = (char)tolower((unsigned char)s[i]);
+        lw[k] = '\0';
+        t->orig[t->n++] = s;
+    }
+}
+
+static const char *nl_at(const nl_toks_t *t, int i) {
+    return (i >= 0 && i < t->n && !t->used[i]) ? t->low[i] : "";
+}
+
+static int nl_is(const char *w, const char *const *list) {
+    for (; *list; list++)
+        if (!strcmp(w, *list))
+            return 1;
+    return 0;
+}
+
+/* Full or short weekday name (optionally plural) -> 0..6, else -1. */
+static int nl_weekday(const char *w, int *plural) {
+    static const char *const names[7][4] = {
+        { "sunday", "sun", NULL }, { "monday", "mon", NULL },
+        { "tuesday", "tue", "tues", NULL }, { "wednesday", "wed", NULL },
+        { "thursday", "thu", "thur", "thurs" }, { "friday", "fri", NULL },
+        { "saturday", "sat", NULL },
+    };
+    char base[48];
+    size_t n = strlen(w);
+    if (plural)
+        *plural = 0;
+    snprintf(base, sizeof(base), "%s", w);
+    for (int pass = 0; pass < 2; pass++) {
+        for (int d = 0; d < 7; d++)
+            for (int k = 0; k < 4 && names[d][k]; k++)
+                if (!strcmp(base, names[d][k])) {
+                    if (plural)
+                        *plural = pass;
+                    return d;
+                }
+        if (n < 2 || base[n - 1] != 's')
+            break;
+        base[n - 1] = '\0'; /* "mondays" */
+    }
+    return -1;
+}
+
+static int nl_month(const char *w) {
+    static const char *const m[12] = { "jan", "feb", "mar", "apr",
+                                       "may", "jun", "jul", "aug",
+                                       "sep", "oct", "nov", "dec" };
+    static const char *const full[12] = {
+        "january", "february", "march",     "april",   "may",      "june",
+        "july",    "august",   "september", "october", "november", "december"
+    };
+    for (int i = 0; i < 12; i++)
+        if (!strcmp(w, m[i]) || !strcmp(w, full[i]) ||
+            (i == 8 && !strcmp(w, "sept")))
+            return i;
+    return -1;
+}
+
+/* "3", "3rd", "21st" -> day of month, else 0. */
+static int nl_mday(const char *w) {
+    char *end;
+    long v = strtol(w, &end, 10);
+    if (end == w || v < 1 || v > 31)
+        return 0;
+    if (*end && strcmp(end, "st") && strcmp(end, "nd") && strcmp(end, "rd") &&
+        strcmp(end, "th"))
+        return 0;
+    return (int)v;
+}
+
+static int nl_number(const char *w) {
+    static const char *const words[] = { "zero", "one", "two",   "three",
+                                         "four", "five", "six",  "seven",
+                                         "eight", "nine", "ten", "eleven",
+                                         "twelve", NULL };
+    char *end;
+    long v;
+    if (!strcmp(w, "a") || !strcmp(w, "an"))
+        return 1;
+    for (int i = 0; words[i]; i++)
+        if (!strcmp(w, words[i]))
+            return i;
+    v = strtol(w, &end, 10);
+    if (end == w || *end || v < 0 || v > 100000)
+        return -1;
+    return (int)v;
+}
+
+/* Minutes per unit word ("min", "hours", "d"...), 0 if not a unit. */
+static int nl_unit(const char *w) {
+    static const char *const mins[] = { "m", "min", "mins", "minute",
+                                        "minutes", NULL };
+    static const char *const hours[] = { "h", "hr", "hrs", "hour", "hours",
+                                         NULL };
+    static const char *const days[] = { "d", "day", "days", NULL };
+    static const char *const weeks[] = { "w", "wk", "wks", "week", "weeks",
+                                         NULL };
+    if (nl_is(w, mins))
+        return 1;
+    if (nl_is(w, hours))
+        return 60;
+    if (nl_is(w, days))
+        return 1440;
+    if (nl_is(w, weeks))
+        return 10080;
+    return 0;
+}
+
+/* Clock time: "9", "9am", "9:30", "9.30pm", "21:00", with an optional
+ * separate "am"/"pm" in `next`. need_marker: a bare "9" only counts after
+ * "at". Returns tokens consumed (1 or 2), 0 if not a time. */
+static int nl_clock(const char *w, const char *next, int need_marker, int *h,
+                    int *m) {
+    int hh = 0, mm = 0, digits = 0, have_colon = 0, ampm = 0, used = 1;
+    const char *p = w;
+    if (!strcmp(w, "noon") || !strcmp(w, "midday")) {
+        *h = 12;
+        *m = 0;
+        return 1;
+    }
+    if (!strcmp(w, "midnight")) {
+        *h = 0;
+        *m = 0;
+        return 1;
+    }
+    while (isdigit((unsigned char)*p) && digits < 2) {
+        hh = hh * 10 + (*p++ - '0');
+        digits++;
+    }
+    if (!digits)
+        return 0;
+    if (*p == ':' || *p == '.') {
+        p++;
+        if (!isdigit((unsigned char)p[0]) || !isdigit((unsigned char)p[1]))
+            return 0;
+        mm = (p[0] - '0') * 10 + (p[1] - '0');
+        p += 2;
+        have_colon = 1;
+    }
+    if (!strcmp(p, "am") || !strcmp(p, "a") || !strcmp(p, "a.m"))
+        ampm = 1;
+    else if (!strcmp(p, "pm") || !strcmp(p, "p") || !strcmp(p, "p.m"))
+        ampm = 2;
+    else if (*p)
+        return 0;
+    if (!ampm && next) {
+        if (!strcmp(next, "am") || !strcmp(next, "a.m")) {
+            ampm = 1;
+            used = 2;
+        } else if (!strcmp(next, "pm") || !strcmp(next, "p.m")) {
+            ampm = 2;
+            used = 2;
+        }
+    }
+    if (!ampm && !have_colon && need_marker)
+        return 0;
+    if (mm > 59)
+        return 0;
+    if (ampm) {
+        if (hh < 1 || hh > 12)
+            return 0;
+        if (ampm == 1 && hh == 12)
+            hh = 0;
+        else if (ampm == 2 && hh != 12)
+            hh += 12;
+    } else if (hh > 23) {
+        return 0;
+    }
+    *h = hh;
+    *m = mm;
+    return used;
+}
+
+/* Part-of-day word -> default hour (and whether it implies pm). */
+static int nl_part_of_day(const char *w) {
+    if (!strcmp(w, "morning"))
+        return 9;
+    if (!strcmp(w, "afternoon"))
+        return 15;
+    if (!strcmp(w, "evening"))
+        return 18;
+    if (!strcmp(w, "night") || !strcmp(w, "tonight"))
+        return 20;
+    return -1;
+}
+
+static void nl_fmt_date(char out[WA_REM_DATE_LEN + 1], int y, int m, int d) {
+    char b[48];
+    snprintf(b, sizeof(b), "%04d-%02d-%02d", y, m, d);
+    snprintf(out, WA_REM_DATE_LEN + 1, "%.10s", b);
+}
+
+/* Wall date of `base` (in tz) plus `days`, as YYYY-MM-DD. */
+static void nl_date_plus(int tz_min, time_t base, int days,
+                         char out[WA_REM_DATE_LEN + 1]) {
+    struct tm w;
+    time_t t;
+    wall_tm(tz_min, base, &w);
+    w.tm_mday += days;
+    w.tm_hour = 12; /* keep away from day edges while normalizing */
+    w.tm_isdst = 0;
+    t = timegm(&w);
+    gmtime_r(&t, &w);
+    nl_fmt_date(out, w.tm_year + 1900, w.tm_mon + 1, w.tm_mday);
+}
+
+static int nl_set_err(char *err, size_t cap, const char *msg) {
+    if (err && cap)
+        snprintf(err, cap, "%s", msg);
+    return -1;
+}
+
+int wa_rem_is_request(const char *text) {
+    char w[16];
+    size_t k = 0;
+    if (!text)
+        return 0;
+    while (*text == ' ' || *text == '\t' || *text == '\n')
+        text++;
+    if (*text == '/')
+        text++;
+    while (*text && !isspace((unsigned char)*text) && *text != ':' &&
+           *text != ',' && k + 1 < sizeof(w))
+        w[k++] = (char)tolower((unsigned char)*text++);
+    w[k] = '\0';
+    return !strcmp(w, "remind") || !strcmp(w, "reminder") ||
+           !strcmp(w, "remindme");
+}
+
+int wa_rem_parse_natural(const char *text, time_t now, int tz_min,
+                         const char *to, wa_rem_spec_t *out, char *err,
+                         size_t errcap) {
+    char buf[1024];
+    nl_toks_t t;
+    int have_time = 0, hint_hour = -1, pm_hint = 0;
+    int day_off = -1, every = 0, weekday = -1, explicit_today = 0;
+    long delta_min = 0;
+    unsigned mask = 0;
+    int i;
+    struct tm w;
+
+    if (!text || !out || !wa_rem_is_request(text))
+        return nl_set_err(err, errcap, "not a reminder request");
+    memset(out, 0, sizeof(*out));
+    out->tz_min = tz_min;
+    snprintf(buf, sizeof(buf), "%s", text);
+    nl_tokenize(buf, &t);
+
+    /* trigger: "remind [me|us]", "/reminder", "remindme" */
+    i = 0;
+    t.used[i++] = 1;
+    if (!strcmp(nl_at(&t, i), "me") || !strcmp(nl_at(&t, i), "us"))
+        t.used[i++] = 1;
+
+    for (i = 0; i < t.n; i++) {
+        const char *x = nl_at(&t, i);
+        int d, plural, h, m, used, tz;
+        if (!*x)
+            continue;
+        /* in 20 minutes / in 2h / in an hour and a half / in half an hour */
+        if (!strcmp(x, "in") || (!strcmp(x, "and") && delta_min)) {
+            int j = i + 1, got = 0;
+            long add = 0;
+            const char *a = nl_at(&t, j);
+            if (!strcmp(a, "half") && !strcmp(nl_at(&t, j + 1), "an") &&
+                !strcmp(nl_at(&t, j + 2), "hour")) {
+                add = 30;
+                got = 3;
+            } else if (!strcmp(a, "a") && !strcmp(nl_at(&t, j + 1), "half") &&
+                       delta_min) {
+                add = 30; /* "and a half" (hour) */
+                got = 2;
+            } else if (!strcmp(a, "the") &&
+                       nl_part_of_day(nl_at(&t, j + 1)) >= 0 &&
+                       !strcmp(x, "in")) {
+                hint_hour = nl_part_of_day(nl_at(&t, j + 1));
+                t.used[i] = t.used[j] = t.used[j + 1] = 1;
+                continue;
+            } else {
+                int num = nl_number(a), u = 0;
+                if (num >= 0 && (u = nl_unit(nl_at(&t, j + 1)))) {
+                    add = (long)num * u;
+                    got = 2;
+                } else {
+                    /* compact "20m" / "2h" / "1h30m" */
+                    char *p;
+                    long v = strtol(a, &p, 10), sum = 0;
+                    while (p != a && v >= 0 && *p) {
+                        char unit[8];
+                        size_t k = 0;
+                        while (isalpha((unsigned char)*p) && k + 1 < sizeof(unit))
+                            unit[k++] = *p++;
+                        unit[k] = '\0';
+                        if (!(u = nl_unit(unit)))
+                            break;
+                        sum += v * u;
+                        if (!*p) {
+                            add = sum;
+                            got = 1;
+                            break;
+                        }
+                        a = p;
+                        v = strtol(a, &p, 10);
+                    }
+                }
+            }
+            if (got) {
+                delta_min += add;
+                t.used[i] = 1;
+                for (int k = 1; k <= got; k++)
+                    t.used[i + k] = 1;
+                i += got;
+                continue;
+            }
+            if (!strcmp(x, "and"))
+                continue;
+        }
+        /* at 9 / at 9:30pm / @ 21:00 / standalone 9pm, 17:30, noon */
+        if (!strcmp(x, "at") || !strcmp(x, "@")) {
+            used = nl_clock(nl_at(&t, i + 1), nl_at(&t, i + 2), 0, &h, &m);
+            if (used && !have_time) {
+                out->hour = h;
+                out->min = m;
+                have_time = 1;
+                t.used[i] = 1;
+                for (int k = 1; k <= used; k++)
+                    t.used[i + k] = 1;
+                i += used;
+                continue;
+            }
+        }
+        if (!have_time) {
+            used = nl_clock(x, nl_at(&t, i + 1), 1, &h, &m);
+            if (used) {
+                out->hour = h;
+                out->min = m;
+                have_time = 1;
+                for (int k = 0; k < used; k++)
+                    t.used[i + k] = 1;
+                i += used - 1;
+                continue;
+            }
+        }
+        if (!strcmp(x, "today")) {
+            day_off = 0;
+            explicit_today = 1;
+            t.used[i] = 1;
+            continue;
+        }
+        if (!strcmp(x, "tonight")) {
+            day_off = 0;
+            explicit_today = 1;
+            hint_hour = 20;
+            pm_hint = 1;
+            t.used[i] = 1;
+            continue;
+        }
+        if (!strcmp(x, "tomorrow") || !strcmp(x, "tmrw") ||
+            !strcmp(x, "tmr") || !strcmp(x, "tomorow")) {
+            day_off = 1;
+            t.used[i] = 1;
+            continue;
+        }
+        if (nl_part_of_day(x) >= 0 && i > 0 &&
+            (t.used[i - 1] || !strcmp(t.low[i - 1], "this"))) {
+            /* "tomorrow morning", "this evening", "every night" */
+            hint_hour = nl_part_of_day(x);
+            pm_hint = hint_hour >= 12;
+            t.used[i] = 1;
+            if (!strcmp(t.low[i - 1], "this"))
+                t.used[i - 1] = 1;
+            if (every && !mask && day_off < 0)
+                every = 1;
+            continue;
+        }
+        if (!strcmp(x, "once")) {
+            t.used[i] = 1;
+            continue;
+        }
+        if (!strcmp(x, "*")) {
+            every = 1;
+            t.used[i] = 1;
+            continue;
+        }
+        if ((strchr(x, '-') || strchr(x, ',')) && wa_rem_days_parse(x)) {
+            /* legacy day lists: "Mon-Fri", "mon,wed" */
+            every = 2;
+            mask |= wa_rem_days_parse(x);
+            t.used[i] = 1;
+            continue;
+        }
+        if (!strcmp(x, "daily") || !strcmp(x, "everyday")) {
+            every = 1;
+            t.used[i] = 1;
+            continue;
+        }
+        if (!strcmp(x, "weekly")) {
+            every = 2;
+            t.used[i] = 1;
+            continue;
+        }
+        if (!strcmp(x, "weekdays")) {
+            every = 2;
+            mask |= 0x3E;
+            t.used[i] = 1;
+            continue;
+        }
+        if (!strcmp(x, "every") || !strcmp(x, "each")) {
+            const char *a = nl_at(&t, i + 1);
+            t.used[i] = 1;
+            if (!strcmp(a, "day")) {
+                every = every ? every : 1;
+                t.used[++i] = 1;
+            } else if (!strcmp(a, "weekday") || !strcmp(a, "weekdays")) {
+                every = 2;
+                mask |= 0x3E;
+                t.used[++i] = 1;
+            } else if (!strcmp(a, "weekend") || !strcmp(a, "weekends")) {
+                every = 2;
+                mask |= 0x41;
+                t.used[++i] = 1;
+            } else if (!strcmp(a, "week")) {
+                every = 2;
+                t.used[++i] = 1;
+            } else if (nl_part_of_day(a) >= 0) {
+                every = every ? every : 1;
+                hint_hour = nl_part_of_day(a);
+                pm_hint = hint_hour >= 12;
+                t.used[++i] = 1;
+            } else if (nl_weekday(a, NULL) >= 0) {
+                every = 2; /* day list follows; handled below */
+            } else {
+                return nl_set_err(err, errcap,
+                                  "I can repeat every day, every weekday, "
+                                  "every weekend, every week or on given "
+                                  "days (every mon and wed)");
+            }
+            continue;
+        }
+        d = nl_weekday(x, &plural);
+        if (d >= 0) {
+            /* "on monday", "next fri", "mondays", "every mon, wed and fri" */
+            if (i > 0 && !t.used[i - 1] &&
+                (!strcmp(t.low[i - 1], "on") || !strcmp(t.low[i - 1], "next") ||
+                 !strcmp(t.low[i - 1], "this")))
+                t.used[i - 1] = 1;
+            t.used[i] = 1;
+            if (every == 2 || plural) {
+                every = 2;
+                mask |= 1u << d;
+                /* swallow list glue: "mon, wed and fri" */
+                while (nl_is(nl_at(&t, i + 1),
+                             (const char *const[]){ "and", "&", "+", NULL }) &&
+                       nl_weekday(nl_at(&t, i + 2), NULL) >= 0) {
+                    t.used[i + 1] = 1;
+                    i++;
+                }
+            } else {
+                weekday = d;
+            }
+            continue;
+        }
+        /* dates: 2026-11-03, "nov 3", "3rd of november", "november 3 2027" */
+        if (wa_rem_date_parse(x, out->date) == 0) {
+            if (i > 0 && !strcmp(t.low[i - 1], "on"))
+                t.used[i - 1] = 1;
+            t.used[i] = 1;
+            continue;
+        }
+        {
+            int mon = -1, mday = 0, span = 0, year = 0;
+            if ((mon = nl_month(x)) >= 0 && (mday = nl_mday(nl_at(&t, i + 1))))
+                span = 2;
+            else if ((mday = nl_mday(x)) &&
+                     ((mon = nl_month(nl_at(&t, i + 1))) >= 0))
+                span = 2;
+            else if (mday && !strcmp(nl_at(&t, i + 1), "of") &&
+                     (mon = nl_month(nl_at(&t, i + 2))) >= 0)
+                span = 3;
+            if (span) {
+                const char *y = nl_at(&t, i + span);
+                if (strlen(y) == 4 && isdigit((unsigned char)y[0]) &&
+                    atoi(y) >= 2000) {
+                    year = atoi(y);
+                    span++;
+                }
+                wall_tm(tz_min, now, &w);
+                if (!year) {
+                    year = w.tm_year + 1900;
+                    if (mon < w.tm_mon || (mon == w.tm_mon && mday < w.tm_mday))
+                        year++;
+                }
+                nl_fmt_date(out->date, year, mon + 1, mday);
+                if (wa_rem_date_parse(out->date, out->date))
+                    return nl_set_err(err, errcap, "that date does not exist");
+                if (i > 0 && !strcmp(t.low[i - 1], "the")) {
+                    t.used[i - 1] = 1;
+                    if (i > 1 && !strcmp(t.low[i - 2], "on"))
+                        t.used[i - 2] = 1;
+                } else if (i > 0 && !strcmp(t.low[i - 1], "on")) {
+                    t.used[i - 1] = 1;
+                }
+                for (int k = 0; k < span; k++)
+                    t.used[i + k] = 1;
+                i += span - 1;
+                continue;
+            }
+        }
+        if ((!strncmp(x, "utc", 3) || !strncmp(x, "gmt", 3)) &&
+            wa_rem_tz_parse(x, &tz) == 0) {
+            out->tz_min = tz;
+            t.used[i] = 1;
+            continue;
+        }
+    }
+
+    /* Reminder text: leftover words, minus leading glue ("to", "that"). */
+    {
+        static const char *const glue[] = { "to",    "that", "about", "of",
+                                            "-",     ":",    "for",   "and",
+                                            "then",  NULL };
+        int first = 1;
+        size_t off = 0;
+        for (i = 0; i < t.n; i++) {
+            if (t.used[i])
+                continue;
+            if (first && nl_is(t.low[i], glue))
+                continue;
+            off += (size_t)snprintf(out->text + off, sizeof(out->text) - off,
+                                    "%s%s", first ? "" : " ", t.orig[i]);
+            if (off >= sizeof(out->text))
+                break;
+            first = 0;
+        }
+        /* drop trailing glue left by "... at the" style phrasing */
+        while (off && strchr(" ,;:-", out->text[off - 1]))
+            out->text[--off] = '\0';
+    }
+    if (!out->text[0])
+        return nl_set_err(err, errcap,
+                          "what should I remind you about? e.g. "
+                          "\"remind me tomorrow at 9am to call mom\"");
+    if (to)
+        snprintf(out->to, sizeof(out->to), "%s", to);
+
+    /* ---- resolve the schedule ---- */
+    if (delta_min > 0) {
+        time_t at = now + (time_t)delta_min * 60;
+        at = ((at + 59) / 60) * 60; /* never early */
+        if (every)
+            return nl_set_err(err, errcap,
+                              "\"in ...\" sets a one-off reminder; for "
+                              "repeats say e.g. \"every day at 8\"");
+        wall_tm(out->tz_min, at, &w);
+        out->hour = w.tm_hour;
+        out->min = w.tm_min;
+        nl_fmt_date(out->date, w.tm_year + 1900, w.tm_mon + 1, w.tm_mday);
+        out->repeat = WA_REM_ONCE;
+        return 0;
+    }
+    if (!have_time) {
+        if (hint_hour >= 0) {
+            out->hour = hint_hour;
+            out->min = 0;
+        } else if (every || day_off >= 0 || weekday >= 0 || out->date[0]) {
+            out->hour = 9;
+            out->min = 0;
+        } else {
+            return nl_set_err(err, errcap,
+                              "when? e.g. \"at 9am\", \"tomorrow at 18:00\", "
+                              "\"in 20 minutes\" or \"every monday at 8\"");
+        }
+    } else if ((pm_hint || (hint_hour >= 12)) && out->hour < 12 &&
+               out->hour >= 1) {
+        out->hour += 12; /* "tonight at 8", "tomorrow evening at 7" */
+    }
+
+    wall_tm(out->tz_min, now, &w);
+    if (every) {
+        if (weekday >= 0)
+            mask |= 1u << weekday;
+        if (every == 1 && !mask) {
+            out->repeat = WA_REM_DAILY;
+        } else {
+            out->repeat = WA_REM_WEEKLY;
+            if (!mask) {
+                int wd = out->date[0] ? date_weekday(out->date) : w.tm_wday;
+                mask = 1u << (wd < 0 ? w.tm_wday : wd);
+            }
+            out->days = mask;
+        }
+        if (day_off > 0)
+            nl_date_plus(out->tz_min, now, day_off, out->date);
+        return 0;
+    }
+
+    out->repeat = WA_REM_ONCE;
+    {
+        int now_min = w.tm_hour * 60 + w.tm_min;
+        int at_min = out->hour * 60 + out->min;
+        if (out->date[0]) {
+            char today[WA_REM_DATE_LEN + 1];
+            nl_date_plus(out->tz_min, now, 0, today);
+            if (strcmp(out->date, today) < 0 ||
+                (!strcmp(out->date, today) && at_min <= now_min))
+                return nl_set_err(err, errcap, "that time is in the past");
+            return 0;
+        }
+        if (weekday >= 0) {
+            int off = (weekday - w.tm_wday + 7) % 7;
+            if (off == 0 && at_min <= now_min)
+                off = 7;
+            day_off = off;
+        } else if (day_off < 0) {
+            day_off = at_min > now_min ? 0 : 1;
+        } else if (explicit_today && at_min <= now_min) {
+            return nl_set_err(err, errcap,
+                              "that time already passed today; try "
+                              "\"tomorrow at ...\"");
+        }
+        nl_date_plus(out->tz_min, now, day_off, out->date);
+    }
+    return 0;
+}
+
+/* Friendly schedule: "tomorrow (Fri 31 Oct) at 09:00 UTC-6". */
+void wa_rem_describe(const wa_reminder_t *r, time_t now, char *out,
+                     size_t cap) {
+    static const char *const MON[] = { "Jan", "Feb", "Mar", "Apr",
+                                       "May", "Jun", "Jul", "Aug",
+                                       "Sep", "Oct", "Nov", "Dec" };
+    char tz[16], when[96];
+    int off;
+    if (!r || !out || !cap)
+        return;
+    off = r->tz_min;
+    if (off == 0)
+        snprintf(tz, sizeof(tz), "UTC");
+    else if (off % 60)
+        snprintf(tz, sizeof(tz), "UTC%c%d:%02d", off < 0 ? '-' : '+',
+                 abs(off) / 60, abs(off) % 60);
+    else
+        snprintf(tz, sizeof(tz), "UTC%c%d", off < 0 ? '-' : '+', abs(off) / 60);
+    if (r->repeat == WA_REM_ONCE && r->date[0]) {
+        char today[WA_REM_DATE_LEN + 1], tmrw[WA_REM_DATE_LEN + 1];
+        int y, mo, d, wd = date_weekday(r->date);
+        nl_date_plus(r->tz_min, now, 0, today);
+        nl_date_plus(r->tz_min, now, 1, tmrw);
+        if (sscanf(r->date, "%d-%d-%d", &y, &mo, &d) != 3 || mo < 1 || mo > 12)
+            snprintf(when, sizeof(when), "%s", r->date);
+        else if (!strcmp(r->date, today))
+            snprintf(when, sizeof(when), "today");
+        else if (!strcmp(r->date, tmrw))
+            snprintf(when, sizeof(when), "tomorrow (%s %d %s)",
+                     wd >= 0 ? DNAMES[wd] : "?", d, MON[mo - 1]);
+        else
+            snprintf(when, sizeof(when), "%s %d %s %d",
+                     wd >= 0 ? DNAMES[wd] : "?", d, MON[mo - 1], y);
+    } else if (r->repeat == WA_REM_ONCE) {
+        snprintf(when, sizeof(when), "next");
+    } else if (r->repeat == WA_REM_DAILY || r->days == 0x7F) {
+        snprintf(when, sizeof(when), "every day");
+    } else if (r->days == 0x3E) {
+        snprintf(when, sizeof(when), "every weekday");
+    } else if (r->days == 0x41) {
+        snprintf(when, sizeof(when), "every weekend");
+    } else {
+        char days[64];
+        wa_rem_days_format(r->days, days);
+        snprintf(when, sizeof(when), "every %s", days);
+    }
+    snprintf(out, cap, "%s at %02d:%02d %s", when, r->hour, r->min, tz);
+    if (r->repeat != WA_REM_ONCE && r->date[0]) {
+        size_t n = strlen(out);
+        snprintf(out + n, cap - n, " from %s", r->date);
+    }
+}
+
+/* Per-install default timezone for chat requests: <auth_dir>/timezone
+ * holds minutes east of UTC. */
+int wa_rem_tz_load(const char *auth_dir, int fallback) {
+    char path[512];
+    FILE *f;
+    int v;
+    snprintf(path, sizeof(path), "%s/timezone", auth_dir ? auth_dir : ".");
+    f = fopen(path, "r");
+    if (!f)
+        return fallback;
+    if (fscanf(f, "%d", &v) != 1 || v < -14 * 60 || v > 14 * 60)
+        v = fallback;
+    fclose(f);
+    return v;
+}
+
+int wa_rem_tz_save(const char *auth_dir, int tz_min) {
+    char path[512];
+    FILE *f;
+    snprintf(path, sizeof(path), "%s/timezone", auth_dir ? auth_dir : ".");
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "%d\n", tz_min);
+    return fclose(f) ? -1 : 0;
+}

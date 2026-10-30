@@ -241,6 +241,15 @@ int wa_noise_encode_frame(wa_noise_t *n, const uint8_t *payload,
     return 0;
 }
 
+int wa_noise_pending(const wa_noise_t *n) {
+    size_t size;
+    if (!n || n->inlen < 3)
+        return 0;
+    size = ((size_t)n->inbuf[0] << 16) | ((size_t)n->inbuf[1] << 8) |
+           n->inbuf[2];
+    return n->inlen >= size + 3;
+}
+
 int wa_noise_feed(wa_noise_t *n, const uint8_t *data, size_t len,
                   wa_frame_cb cb, void *user) {
     int frames = 0;
