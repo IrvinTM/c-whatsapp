@@ -31,10 +31,10 @@ via `tools/gen_tokens.py`).
       keys, session reload after restart, peer session resets, retry
       receipts, delivery receipts (and optional read receipts with
       `--read-receipts`).
-- [x] Reminders: once/daily/weekly schedules, dates, fixed timezones,
-      CLI management, plain-language chat requests ("remind me tomorrow
-      at 9am to call mom") restricted to `CWA_ALLOW` numbers, `--daemon`
-      and `--listen` modes. See [deploy/README.md](deploy/README.md) for
+- [x] Reminders: once/daily/weekly schedules, dates, fixed UTC-6 offset,
+      CLI management, chat requests in a fixed format (`reminder every sat
+      1pm class`, UTC-6) restricted to `CWA_ALLOW` numbers, `--daemon` and
+      `--listen` modes. See [deploy/README.md](deploy/README.md) for
       running it as a small always-on service.
 
 Still missing: group sender keys, media upload/download, rich message

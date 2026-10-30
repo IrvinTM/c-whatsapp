@@ -8,7 +8,7 @@
  * days:   weekly day mask ("Mon-Fri", "*"), "-" when unused
  *
  * Legacy 5-field lines (id, days, HH:MM, to, text) are still read and are
- * treated as weekly reminders in the process's local timezone.
+ * treated as weekly reminders in WA_REM_TZ.
  */
 #ifndef WA_REMIND_H
 #define WA_REMIND_H
@@ -24,6 +24,8 @@ extern "C" {
 #define WA_REM_TEXT_MAX 512
 #define WA_REM_MAX 256
 #define WA_REM_DATE_LEN 10
+/* Every new reminder uses this fixed offset (minutes east of UTC): UTC-6. */
+#define WA_REM_TZ (-360)
 
 enum {
     WA_REM_ONCE = 0,
@@ -70,12 +72,9 @@ int wa_rem_date_parse(const char *s, char out[WA_REM_DATE_LEN + 1]);
  * Returns 0 on success. */
 int wa_rem_tz_parse(const char *s, int *tz_min);
 
-/* Minutes east of UTC for the process's local timezone right now. */
-int wa_rem_local_offset(void);
-
 /* Load all reminders from <auth_dir>/reminders.tsv. Returns count or -1. */
 int wa_rem_load(const char *auth_dir, wa_reminder_t *out, int cap);
-/* Append a weekly reminder in local time (legacy convenience API). */
+/* Append a weekly reminder in WA_REM_TZ (legacy convenience API). */
 int wa_rem_add(const char *auth_dir, unsigned days, int hour, int min,
                const char *to, const char *text);
 /* Append a fully specified reminder. Returns new id or -1. */
@@ -100,15 +99,15 @@ int wa_rem_parse_cmd(const char *body, const char *default_to,
  * "remindme"). */
 int wa_rem_is_request(const char *text);
 
-/* Parse a plain-language request such as
- *   "remind me tomorrow at 9am to call mom"
- *   "remind me in 20 minutes to take the pizza out"
- *   "remind me every weekday at 7:50 class starts"
- *   "remind me on friday evening to pay rent"
- *   "remind me nov 3 at 14:30 UTC-6 dentist"
- * `now` and `tz_min` resolve relative dates; `to` is the recipient.
+/* Parse a chat request in the fixed format
+ *   reminder WHEN TIME TEXT
+ *   reminder in DELAY TEXT
+ * WHEN: every day | every weekday | every weekend | every sat | every mon,wed
+ *       | today | tomorrow | sat | 2026-11-03 | nov 3
+ * TIME: 13:00 | 1pm | 1:30 pm (optional leading "at"; a bare "1" is rejected)
+ * TEXT is kept as typed. "remind" and "remind me" also work as the trigger.
  * Returns 0 on success; -1 with a human hint in err otherwise. */
-int wa_rem_parse_natural(const char *text, time_t now, int tz_min,
+int wa_rem_parse_request(const char *text, time_t now, int tz_min,
                          const char *to, wa_rem_spec_t *out, char *err,
                          size_t errcap);
 
@@ -116,10 +115,6 @@ int wa_rem_parse_natural(const char *text, time_t now, int tz_min,
  * "every weekday at 07:50 UTC-6". */
 void wa_rem_describe(const wa_reminder_t *r, time_t now, char *out,
                      size_t cap);
-
-/* Default timezone for chat requests, stored in <auth_dir>/timezone. */
-int wa_rem_tz_load(const char *auth_dir, int fallback);
-int wa_rem_tz_save(const char *auth_dir, int tz_min);
 
 /* One-line schedule summary: "2026-10-21 07:50 UTC-6 weekly". */
 void wa_rem_fmt_schedule(const wa_reminder_t *r, char *out, size_t cap);

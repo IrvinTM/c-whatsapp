@@ -45,8 +45,6 @@ static void usage(const char *argv0) {
     printf("  --read-receipts  send read receipts for inbound messages (listen/daemon)\n");
     printf("  --allow NUMS     numbers allowed to manage reminders over chat\n");
     printf("                   (comma-separated; default: $CWA_ALLOW)\n");
-    printf("  --tz OFFSET      default timezone for chat reminders, e.g. UTC-6\n");
-    printf("                   (default: $CWA_TZ, else system local time)\n");
     printf("  -h, --help       this help\n");
 }
 
@@ -100,7 +98,6 @@ int main(int argc, char **argv) {
     int want_listen = 0;
     int want_read_receipts = 0;
     const char *allow = getenv("CWA_ALLOW");
-    const char *tz_arg = getenv("CWA_TZ");
     int want_list = 0;
     int want_del = -1;
     const char *ra_days = NULL, *ra_time = NULL, *ra_to = NULL;
@@ -125,8 +122,6 @@ int main(int argc, char **argv) {
             want_read_receipts = 1;
         } else if (!strcmp(argv[i], "--allow") && i + 1 < argc) {
             allow = argv[++i];
-        } else if (!strcmp(argv[i], "--tz") && i + 1 < argc) {
-            tz_arg = argv[++i];
         } else if (!strcmp(argv[i], "--remind-list")) {
             want_list = 1;
         } else if (!strcmp(argv[i], "--remind-del") && i + 1 < argc) {
@@ -296,11 +291,6 @@ int main(int argc, char **argv) {
     opts.listen = want_listen;
     opts.read_receipts = want_read_receipts;
     opts.allow = allow;
-    opts.tz_min = wa_rem_local_offset();
-    if (tz_arg && *tz_arg && wa_rem_tz_parse(tz_arg, &opts.tz_min)) {
-        fprintf(stderr, "bad timezone '%s' (use e.g. UTC-6)\n", tz_arg);
-        return 2;
-    }
     opts.receipt_wait_ms = (want_daemon || want_listen) ? 3000 : 15000;
     opts.on_message = on_message;
     /* Daemons and listeners are services: run until stopped unless the
