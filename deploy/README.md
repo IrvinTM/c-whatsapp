@@ -115,9 +115,11 @@ that doesn't fit the format is not saved, and the reply says why. Reminders
 created in chat are delivered to the sender's number.
 
 Repeating (nag) reminders are described in the next section. The daemon
-reloads `reminders.tsv` every 15 seconds
-and also checks the previous minute, so a slow send does not make it miss its
-slot.
+reloads `reminders.tsv` every 15 seconds. So that messages do not look
+robotic, each one goes out at a random moment within 5 minutes either side of
+its time (a 13:00 class reminder arrives between 12:55 and 13:05, at a
+different point each week). A send that is up to 2 minutes late, for example
+after a slow send, still goes out.
 
 `--timeout` is optional for `--daemon` and `--listen`; they run until stopped
 by default. Use `--timeout SECS` only for a bounded test run.
@@ -149,16 +151,17 @@ works too. `done N` on a normal reminder is refused and points at `delete`.
 
 Timing and limits:
 
-- **Jitter.** Each gap is the interval plus or minus a random 0 to 5 minutes
-  (never closer than 5 minutes to the previous message), so the messages are
-  not robotically regular. The gap is computed from the scheduled time, so
-  polling lag does not accumulate.
+- **Jitter.** Messages follow a fixed grid from the creation time (a nag
+  made at 04:13 is due at 05:13, 06:13, ...), and each one is sent at a
+  random point within 5 minutes either side of its slot (never closer than
+  5 minutes to the previous message). The randomness never accumulates, so
+  a nag does not drift away from its times.
 - **Caps.** At most 24 messages per nag; the 24th says it is the last
   reminder and the nag then removes itself. At most 5 nags are active; a new
   one is refused until you settle one.
 - **Downtime.** If the daemon was down or offline when a message was due, it
-  sends at most one catch-up message after it returns, then reschedules from
-  that moment. A failed send is retried after 2 minutes.
+  sends at most one catch-up message after it returns, then continues with
+  the next grid slot at least half an interval away. A failed send is retried after 2 minutes.
 - **Time zone.** Times shown are still UTC-6. There are no quiet hours: nags
   send around the clock.
 

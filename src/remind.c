@@ -513,12 +513,41 @@ time_t wa_rem_nag_jitter(time_t nominal, time_t now, uint32_t rnd) {
     return t;
 }
 
+/* floor(a / b) for b > 0, also for negative a. */
+static time_t floor_div(time_t a, time_t b) {
+    return a >= 0 ? a / b : -((-a + b - 1) / b);
+}
+
+/* Epoch of a reminder's date + HH:MM in its timezone, 0 if unusable. */
+static time_t rem_start(const wa_reminder_t *r) {
+    struct tm dt;
+    time_t t;
+    memset(&dt, 0, sizeof(dt));
+    if (sscanf(r->date, "%4d-%2d-%2d", &dt.tm_year, &dt.tm_mon,
+               &dt.tm_mday) != 3)
+        return 0;
+    dt.tm_year -= 1900;
+    dt.tm_mon -= 1;
+    dt.tm_hour = r->hour;
+    dt.tm_min = r->min;
+    t = timegm(&dt);
+    return t == (time_t)-1 ? 0 : t - (time_t)r->tz_min * 60;
+}
+
 time_t wa_rem_nag_next(const wa_reminder_t *r, time_t now, uint32_t rnd) {
-    /* Count from the scheduled time so polling lag never accumulates, but
-     * after an outage start over from now: one catch-up send, no burst. */
-    time_t base = (now - r->next_fire <= WA_REM_NAG_LATE_S) ? r->next_fire
-                                                            : now;
-    return wa_rem_nag_jitter(base + (time_t)r->interval_min * 60, now, rnd);
+    /* Sends sit on a fixed grid (creation + k * interval), each jittered
+     * around its slot, so they never drift. next_fire is within the jitter
+     * (or a retry) of the slot it served; the next slot is one interval on.
+     * After an outage skip the missed slots: one catch-up send, no burst. */
+    time_t iv = (time_t)r->interval_min * 60, a = rem_start(r), slot;
+    if (iv <= 0)
+        iv = (time_t)WA_REM_NAG_MIN_INTERVAL * 60;
+    if (a <= 0)
+        a = r->next_fire;
+    slot = a + (floor_div(r->next_fire - a + iv / 2, iv) + 1) * iv;
+    if (slot < now + iv / 2)
+        slot += (floor_div(now + iv / 2 - slot - 1, iv) + 1) * iv;
+    return wa_rem_nag_jitter(slot, now, rnd);
 }
 
 int wa_rem_nag_due(const wa_reminder_t *r, time_t now) {
@@ -580,6 +609,30 @@ int wa_rem_due(const wa_reminder_t *r, time_t now) {
     default:
         return 0;
     }
+}
+
+int wa_rem_jitter_offset(int id, time_t slot) {
+    uint64_t x = ((uint64_t)(uint32_t)id << 32) ^ (uint64_t)floor_div(slot, 60);
+    x += 0x9E3779B97F4A7C15ull; /* splitmix64 */
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
+    x ^= x >> 31;
+    return (int)(x % (2 * WA_REM_JITTER_S + 1)) - WA_REM_JITTER_S;
+}
+
+time_t wa_rem_due_slot(const wa_reminder_t *r, time_t now) {
+    time_t first = floor_div(now - WA_REM_JITTER_S - WA_REM_LATE_S, 60) * 60;
+    if (!r || r->repeat == WA_REM_NAG)
+        return 0;
+    for (time_t t = first; t <= now + WA_REM_JITTER_S; t += 60) {
+        time_t send;
+        if (!wa_rem_due(r, t))
+            continue;
+        send = t + wa_rem_jitter_offset(r->id, t);
+        if (send <= now && now - send <= WA_REM_LATE_S)
+            return t;
+    }
+    return 0;
 }
 
 /* Shaped like YYYY-MM-DD even if the value is invalid. */
@@ -988,6 +1041,30 @@ static int nl_set_err(char *err, size_t cap, const char *msg) {
     return -1;
 }
 
+/* "2:40 class PM": a "PM" later in the message almost certainly belongs to a
+ * time that would otherwise run 12 hours early. Only a marker-less hour that
+ * could be either counts, so "02:40" keeps a stray "PM" as text. A stray "AM"
+ * needs no check: the time is already right. Returns 1 and sets err if found. */
+static int nl_stray_pm(const nl_toks_t *t, int clock_i, int from, int hour,
+                       int min, char *err, size_t errcap) {
+    const char *w = nl_at(t, clock_i);
+    char msg[128];
+    if (hour < 1 || hour > 11 || w[0] == '0' ||
+        !isdigit((unsigned char)w[strlen(w) - 1]))
+        return 0;
+    for (int k = from; k < t->n; k++) {
+        if (strcmp(nl_at(t, k), "pm") && strcmp(nl_at(t, k), "p.m"))
+            continue;
+        snprintf(msg, sizeof(msg),
+                 "PM must come right after the time: use %d:%02dpm or %d:%02d "
+                 "(or %02d:%02d for the morning)",
+                 hour, min, hour + 12, min, hour, min);
+        nl_set_err(err, errcap, msg);
+        return 1;
+    }
+    return 0;
+}
+
 int wa_rem_is_request(const char *text) {
     char w[16];
     size_t k = 0;
@@ -1225,6 +1302,9 @@ int wa_rem_parse_request(const char *text, time_t now, int tz_min,
                 return nl_set_err(err, errcap,
                                   "I need a time after the day, like 13:00 "
                                   "or 1pm");
+            if (used == 1 && nl_stray_pm(&t, i, i + 1, out->hour, out->min,
+                                         err, errcap))
+                return -1;
             i += used;
         }
     }

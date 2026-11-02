@@ -35,12 +35,17 @@ extern "C" {
 /* Every new reminder uses this fixed offset (minutes east of UTC): UTC-6. */
 #define WA_REM_TZ (-360)
 
-/* Nag reminders: repeat every interval until settled, each gap jittered. */
+/* Every send lands at a random point within +/- this of its scheduled time,
+ * so messages do not look robotic. */
+#define WA_REM_JITTER_S 300
+#define WA_REM_LATE_S 120 /* a missed send this late still goes out */
+
+/* Nag reminders: repeat every interval until settled, each send jittered
+ * around a fixed grid (creation + k * interval). */
 #define WA_REM_NAG_MIN_INTERVAL 15   /* minutes */
 #define WA_REM_NAG_MAX_INTERVAL 1440 /* minutes */
-#define WA_REM_NAG_JITTER_S 300      /* +/- seconds around each interval */
+#define WA_REM_NAG_JITTER_S WA_REM_JITTER_S
 #define WA_REM_NAG_MIN_GAP_S 300     /* never schedule closer than this */
-#define WA_REM_NAG_LATE_S 120        /* later than this: rebase on now */
 #define WA_REM_NAG_RETRY_S 120       /* failed send: try again after */
 #define WA_REM_NAG_MAX_SENDS 24      /* then the nag removes itself */
 #define WA_REM_NAG_MAX_ACTIVE 5
@@ -120,12 +125,22 @@ void wa_rem_from_spec(wa_reminder_t *out, int id, const wa_rem_spec_t *spec);
  * Always 0 for WA_REM_NAG: those use wa_rem_nag_due. */
 int wa_rem_due(const wa_reminder_t *r, time_t now);
 
+/* Randomised send time for daily/weekly/once reminders. Pure functions. */
+/* Offset in [-JITTER_S, +JITTER_S] seconds for occurrence `slot` of reminder
+ * `id`: random-looking, but the same on every poll and after a restart. */
+int wa_rem_jitter_offset(int id, time_t slot);
+/* The scheduled time (minute, UTC epoch) of the occurrence of r whose
+ * jittered send time is in [now - LATE_S, now], or 0. Dedupe on (id, slot).
+ * Always 0 for WA_REM_NAG. */
+time_t wa_rem_due_slot(const wa_reminder_t *r, time_t now);
+
 /* Nag scheduling. Pure functions, `rnd` is any random 32-bit value. */
 /* nominal + (rnd % 601 - 300) seconds, never earlier than now + MIN_GAP_S. */
 time_t wa_rem_nag_jitter(time_t nominal, time_t now, uint32_t rnd);
-/* Time of the send after serving r->next_fire at `now`. The base is the
- * scheduled time (no drift from polling lag), or `now` if more than
- * LATE_S late (after an outage: one catch-up send, never a burst). */
+/* Time of the send after serving r->next_fire at `now`: the next slot on
+ * the grid date/HH:MM + k * interval, jittered. Slots less than half an
+ * interval ahead of `now` are skipped (after an outage: one catch-up send,
+ * never a burst). */
 time_t wa_rem_nag_next(const wa_reminder_t *r, time_t now, uint32_t rnd);
 /* 1 if r is a nag and next_fire <= now. */
 int wa_rem_nag_due(const wa_reminder_t *r, time_t now);
