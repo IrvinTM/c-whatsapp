@@ -1757,9 +1757,10 @@ fail:
     wa_node_free(iq);
 }
 
-/* Daemon: poll reminders.tsv and send due ones. We check the current and the
- * previous minute so a slow send cannot make a reminder slip past its slot,
- * and dedupe on (id, minute) so the grace window never double-fires. */
+/* Daemon: poll reminders.tsv and send due ones. Each occurrence goes out at
+ * a random point within +/- 5 minutes of its time (wa_rem_due_slot), with a
+ * short grace so a slow send cannot skip it; dedupe on (id, slot minute) so
+ * the window never double-fires. */
 static int reminder_fired(int id, long long minute) {
     for (int k = 0; k < n_fired; k++)
         if (fired_minutes[k] == minute && fired_ids[k] == id)
@@ -1782,6 +1783,8 @@ static void daemon_poll(run_t *r) {
      * of it resident for the life of the process. */
     wa_reminder_t *rems = malloc(sizeof(*rems) * WA_REM_MAX);
     int n, i, nag_done = 0;
+    time_t slot;
+    long long minute;
     if (!rems)
         return;
     n = wa_rem_load(r->opts->auth_dir, rems, WA_REM_MAX);
@@ -1822,30 +1825,26 @@ static void daemon_poll(run_t *r) {
             }
             continue;
         }
-        for (int back = 0; back < 2; back++) {
-            time_t when = now - back * 60;
-            long long minute = (long long)when / 60;
-            if (!wa_rem_due(&rems[i], when))
-                continue;
-            if (reminder_fired(rems[i].id, minute))
-                continue;
-            rlog(r, "reminder due id=%d to=%s text='%s'", rems[i].id,
-                 rems[i].to, rems[i].text);
-            char msg[WA_REM_TEXT_MAX + 16];
-            snprintf(msg, sizeof(msg), "\xe2\x8f\xb0 %s", rems[i].text);
-            if (do_send_text(r, rems[i].to, msg) == 0) {
-                rlog(r, "reminder sent id=%d", rems[i].id);
-                mark_reminder_fired(rems[i].id, minute);
-                if (rems[i].repeat == WA_REM_ONCE)
-                    wa_rem_del(r->opts->auth_dir, rems[i].id);
-            } else {
-                rlog(r, "reminder failed id=%d (will retry next check)",
-                     rems[i].id);
-            }
-            if (r->outcome >= 0) {
-                free(rems);
-                return;
-            }
+        slot = wa_rem_due_slot(&rems[i], now);
+        minute = (long long)slot / 60;
+        if (!slot || reminder_fired(rems[i].id, minute))
+            continue;
+        rlog(r, "reminder due id=%d to=%s text='%s' (%+ds)", rems[i].id,
+             rems[i].to, rems[i].text, (int)(now - slot));
+        char msg[WA_REM_TEXT_MAX + 16];
+        snprintf(msg, sizeof(msg), "\xe2\x8f\xb0 %s", rems[i].text);
+        if (do_send_text(r, rems[i].to, msg) == 0) {
+            rlog(r, "reminder sent id=%d", rems[i].id);
+            mark_reminder_fired(rems[i].id, minute);
+            if (rems[i].repeat == WA_REM_ONCE)
+                wa_rem_del(r->opts->auth_dir, rems[i].id);
+        } else {
+            rlog(r, "reminder failed id=%d (will retry next check)",
+                 rems[i].id);
+        }
+        if (r->outcome >= 0) {
+            free(rems);
+            return;
         }
     }
     free(rems);

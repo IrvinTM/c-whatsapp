@@ -384,6 +384,31 @@ int main(void) {
     nl("reminder every hour at 9am x", 0, NULL, 0, 0, 0, 0, NULL);
     nl("reminder every hour 9am x", 0, NULL, 0, 0, 0, 0, NULL);
     nl("reminder every hour from 9am x", 0, NULL, 0, 0, 0, 0, NULL);
+    /* a PM away from the time must not silently mean the morning */
+    nl("Reminder every sat 2:40 DRS135 (Teorico-1) PM https://meet.google.com/x",
+       0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder tomorrow at 9:30 call back p.m.", 0, NULL, 0, 0, 0, 0, NULL);
+    nl("reminder every sat 2:40pm class PM", 1, NULL, 14, 40, WA_REM_WEEKLY,
+       0x40, "class PM");
+    nl("reminder every sat 2:40 PM class", 1, NULL, 14, 40, WA_REM_WEEKLY,
+       0x40, "class");
+    nl("reminder every sat 02:40 sync with PM", 1, NULL, 2, 40, WA_REM_WEEKLY,
+       0x40, "sync with PM");
+    nl("reminder every sat 2:40am sync with PM", 1, NULL, 2, 40, WA_REM_WEEKLY,
+       0x40, "sync with PM");
+    nl("reminder every sat 13:00 sync with PM", 1, NULL, 13, 0, WA_REM_WEEKLY,
+       0x40, "sync with PM");
+    nl("reminder every sat 12:30 lunch PM", 1, NULL, 12, 30, WA_REM_WEEKLY,
+       0x40, "lunch PM");
+    nl("reminder every sat 2:40 class AM", 1, NULL, 2, 40, WA_REM_WEEKLY,
+       0x40, "class AM");
+    {
+        wa_rem_spec_t sp;
+        char err[256] = "";
+        wa_rem_parse_request("reminder every sat 2:40 class PM", NOW_FRI, -360,
+                             "+1", &sp, err, sizeof(err));
+        ok(strstr(err, "2:40pm or 14:40") != NULL, err);
+    }
     {
         wa_rem_spec_t sp;
         char err[256] = "";
@@ -434,48 +459,119 @@ int main(void) {
            "jitter floor beats a stale nominal");
     }
 
-    /* nag_next: scheduled-time base, no drift, no burst after an outage */
+    /* nag_next: a fixed grid (creation + k * interval), no drift, no burst
+     * after an outage. mk_nag's creation time 10:15 UTC-6 is NOW_FRI - 20. */
     {
         wa_reminder_t r;
-        time_t start = NOW_FRI + 3600, t;
-        int gaps_ok = 1;
-        mk_nag(&r, 3, 60, NOW_FRI - 10, 0, "x");
-        ok(wa_rem_nag_next(&r, NOW_FRI, 300) == NOW_FRI - 10 + 3600,
-           "nag_next on time counts from next_fire");
-        mk_nag(&r, 3, 60, NOW_FRI - 3 * 86400, 5, "x");
-        ok(wa_rem_nag_next(&r, NOW_FRI, 300) == NOW_FRI + 3600,
-           "nag_next three days late counts from now (no burst)");
-        mk_nag(&r, 3, 60, NOW_FRI - WA_REM_NAG_LATE_S, 5, "x");
-        ok(wa_rem_nag_next(&r, NOW_FRI, 300) ==
-               NOW_FRI - WA_REM_NAG_LATE_S + 3600,
-           "nag_next exactly LATE_S late still counts from next_fire");
-        mk_nag(&r, 3, 60, NOW_FRI - WA_REM_NAG_LATE_S - 1, 5, "x");
-        ok(wa_rem_nag_next(&r, NOW_FRI, 300) == NOW_FRI + 3600,
-           "nag_next one second past LATE_S rebases on now");
-        mk_nag(&r, 3, 15, NOW_FRI + 5, 0, "x");
-        ok(wa_rem_nag_next(&r, NOW_FRI, 0) >= NOW_FRI + 300,
+        time_t A = NOW_FRI - 20, H = 3600, nx;
+        int grid_ok = 1, gaps_ok = 1;
+        ok(A % 60 == 0, "mk_nag anchor is on the minute");
+        mk_nag(&r, 3, 60, A + H - 10, 0, "x");
+        ok(wa_rem_nag_next(&r, A + H, 300) == A + 2 * H,
+           "nag_next early send: next slot is anchor + 2h");
+        mk_nag(&r, 3, 60, A + H + 290, 0, "x");
+        ok(wa_rem_nag_next(&r, A + H + 300, 300) == A + 2 * H,
+           "nag_next late send does not push the next slot");
+        mk_nag(&r, 3, 60, A + H + 120 + 120, 0, "x"); /* retried */
+        ok(wa_rem_nag_next(&r, A + H + 240, 300) == A + 2 * H,
+           "nag_next after a retry stays on the grid");
+        /* the live bug: 04:13 nag drifted to 05:16, 06:16, 07:19 */
+        mk_nag(&r, 3, 60, A + 2 * H + 6 * 60 + 41, 2, "x");
+        ok(wa_rem_nag_next(&r, A + 2 * H + 6 * 60 + 45, 300) == A + 3 * H,
+           "nag_next pulls a drifted nag back onto the grid");
+        mk_nag(&r, 3, 60, A + H, 5, "x");
+        nx = wa_rem_nag_next(&r, A + 3 * 86400 + 600, 300);
+        ok(nx == A + 3 * 86400 + H,
+           "nag_next three days late: next grid slot, no burst");
+        nx = wa_rem_nag_next(&r, A + 3 * 86400 + 40 * 60, 300);
+        ok(nx == A + 3 * 86400 + 2 * H,
+           "nag_next skips a slot less than half an interval away");
+        mk_nag(&r, 3, 15, A + 15 * 60, 0, "x");
+        ok(wa_rem_nag_next(&r, A + 15 * 60 + 600, 0) >=
+               A + 15 * 60 + 600 + WA_REM_NAG_MIN_GAP_S,
            "nag_next never closer than the minimum gap");
+        r.date[0] = '\0'; /* no creation date: grid from next_fire */
+        r.next_fire = A;
+        ok(wa_rem_nag_next(&r, A + 10, 300) == A + 15 * 60,
+           "nag_next without a date counts from next_fire");
 
-        mk_nag(&r, 3, 45, start, 0, "x");
-        t = start;
-        for (int k = 0; k < 10; k++) {
-            time_t nx = wa_rem_nag_next(&r, r.next_fire + 14, 300);
-            if (nx - r.next_fire != 45 * 60)
-                gaps_ok = 0;
+        /* 24 random sends, each 0-60s late: every one within +-300s of
+         * anchor + k*interval, whatever the earlier jitter was */
+        mk_nag(&r, 3, 60, A + H, 0, "x");
+        for (uint32_t k = 1; k <= 24; k++) {
+            time_t now = r.next_fire + (k * 13) % 61;
+            nx = wa_rem_nag_next(&r, now, k * 2654435761u);
+            if (nx < A + (k + 1) * H - 300 || nx > A + (k + 1) * H + 300)
+                grid_ok = 0;
             r.next_fire = nx;
             r.sent++;
         }
-        ok(r.next_fire == t + 10 * 45 * 60 && gaps_ok,
-           "ten sends 14s late each end at start + 10*interval");
-        gaps_ok = 1;
+        ok(grid_ok, "24 jittered sends stay within +-300s of the grid");
         for (uint32_t k = 0; k < 2000; k++) {
-            time_t nx;
-            mk_nag(&r, 3, 60, start, 0, "x");
-            nx = wa_rem_nag_next(&r, start + 3, k * 7919u);
-            if (nx - start < 3600 - 300 || nx - start > 3600 + 300)
+            mk_nag(&r, 3, 45, A + 45 * 60, 0, "x");
+            nx = wa_rem_nag_next(&r, A + 45 * 60 + 3, k * 7919u);
+            if (nx < A + 90 * 60 - 300 || nx > A + 90 * 60 + 300)
                 gaps_ok = 0;
         }
-        ok(gaps_ok, "each gap within interval +-300s");
+        ok(gaps_ok, "each send within +-300s of its slot");
+    }
+
+    /* jittered daily/weekly/once sends */
+    {
+        wa_reminder_t r;
+        time_t T = NOW_FRI - 20 + 3600; /* Fri 11:15 UTC-6 */
+        int stable = 1, in_range = 1, spread_lo = 0, spread_hi = 0, once = 1;
+        for (int id = 1; id <= 500; id++) {
+            int o = wa_rem_jitter_offset(id, T);
+            if (o != wa_rem_jitter_offset(id, T))
+                stable = 0;
+            if (o < -300 || o > 300)
+                in_range = 0;
+            spread_lo |= o < -250;
+            spread_hi |= o > 250;
+        }
+        ok(stable && in_range, "jitter_offset stable and within +-300s");
+        ok(spread_lo && spread_hi, "jitter_offset spreads over the range");
+        ok(wa_rem_jitter_offset(1, T) != wa_rem_jitter_offset(1, T + 86400) ||
+               wa_rem_jitter_offset(1, T + 86400) !=
+                   wa_rem_jitter_offset(1, T + 2 * 86400),
+           "jitter_offset changes between occurrences");
+
+        memset(&r, 0, sizeof(r));
+        r.hour = 11;
+        r.min = 15;
+        r.tz_min = -360;
+        r.repeat = WA_REM_DAILY;
+        snprintf(r.date, sizeof(r.date), "%s", "2026-10-30");
+        for (int id = 1; id <= 300; id++) {
+            int hits = 0;
+            time_t first = 0;
+            r.id = id;
+            for (time_t now = T - 900; now <= T + 900; now += 15) {
+                time_t s = wa_rem_due_slot(&r, now);
+                if (s && s != T)
+                    once = 0;
+                if (s && !first)
+                    first = now;
+                hits += s != 0;
+            }
+            /* due for LATE_S after the send time, polled every 15s */
+            if (!first || hits < 8 || hits > 9 ||
+                first - T < wa_rem_jitter_offset(id, T) ||
+                first - T >= wa_rem_jitter_offset(id, T) + 15)
+                once = 0;
+        }
+        ok(once, "due_slot: one slot, from its jittered time for LATE_S");
+        r.id = 7;
+        ok(!wa_rem_due_slot(&r, T + 301 + WA_REM_LATE_S),
+           "due_slot: nothing past jitter + grace");
+        r.repeat = WA_REM_WEEKLY;
+        r.days = 1u << 6; /* Sat only; T is a Friday */
+        ok(!wa_rem_due_slot(&r, T + wa_rem_jitter_offset(7, T)),
+           "due_slot: weekly not on another day");
+        r.repeat = WA_REM_NAG;
+        ok(!wa_rem_due_slot(&r, T), "due_slot: 0 for a nag");
+        ok(!wa_rem_due_slot(NULL, T), "due_slot: 0 for NULL");
     }
 
     /* nag_due / wa_rem_due */
